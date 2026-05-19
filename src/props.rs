@@ -197,6 +197,12 @@ pub struct PamsoftProps {
     /// we honour it so users can actually tune the lower bound.
     pub edge_sensitivity: [f64; 2],
     pub seg_method: String,
+    /// `Diagnostic Output` property. When `false`, stage 6 drops the
+    /// 9 diagnostic-only quant columns (Bad_Spot, Diameter, Empty_Spot,
+    /// Fraction_Ignored, Position_Offset, Replaced_Spot,
+    /// Mean_Background, Mean_SigmBg, Mean_Signal) from the result
+    /// table — matches R main.R:232-237.
+    pub is_diagnostic: bool,
 }
 
 /// Read the operator's properties from a `OperatorSettings` proto.
@@ -206,6 +212,7 @@ pub fn read_pamsoft_props(settings: Option<&OperatorSettings>) -> Result<Pamsoft
     let r = OperatorPropertyReader::new(settings);
     let edge_low = r.get_f64("EdgeSensitivityLow")?;
     let edge_high = r.get_f64("Edge Sensitivity")?;
+    let diagnostic_value = r.get_enum("Diagnostic Output")?;
     Ok(PamsoftProps {
         min_diameter: r.get_f64("Min Diameter")?,
         max_diameter: r.get_f64("Max Diameter")?,
@@ -215,6 +222,7 @@ pub fn read_pamsoft_props(settings: Option<&OperatorSettings>) -> Result<Pamsoft
         saturation_limit: r.get_f64("Saturation Limit")?,
         edge_sensitivity: [edge_low, edge_high],
         seg_method: r.get_enum("Segmentation Method")?,
+        is_diagnostic: diagnostic_value == "Yes",
     })
 }
 

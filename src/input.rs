@@ -1,83 +1,121 @@
-//! Input table reading for the pamsoft_grid operator.
+//! Input table reading for the pamsoft_grid_qt operator.
 //!
-//! The operator's input is a Tercen crosstab where:
+//! The QT operator's input is the *melted* output of the upstream
+//! pamsoft_grid step joined with the source images. Three Tercen tables
+//! to stream:
 //!
-//!   * The **column factor** carries one or two `documentId`-typed
-//!     factors — Tercen document IDs of the image ZIP (and optionally
-//!     the layout file). Matches the R operator's contract.
-//!   * The **y-axis projection** carries at least one label factor —
-//!     the per-image **filename stem** (the `ctx$labels[[1]]` the R
-//!     operator uses).
+//!   * **Column-facet** (`column_hash`): one row per `(image × spot)`
+//!     combination — i.e. one per crosstab column. Carries
+//!     `documentId(s)`, `grdImageNameUsed`, `Image`, `spotRow`,
+//!     `spotCol`, `ID`.
+//!   * **Row-facet** (`row_hash`): one row per gathered variable name.
+//!     Single column `variable` (typically namespace-prefixed by the
+//!     Gather step, e.g. `"ds1.gridX"`).
+//!   * **Main data** (`qt_hash`): `.ci`, `.ri`, `.y` — the actual
+//!     gathered value at each `(column, row)` cell.
 //!
-//! Labels do NOT live on the column-facet table — `ctx$labels[[1]]` in
-//! R is broadcast into the main data table (`qt_hash`), one value per
-//! `(.ri, .ci)` cell. To get one label per crosstab column we stream
-//! `.ci` + label from `qt_hash` and take the first non-null value seen
-//! per `.ci`. We separately stream the column-facet (positional `.ci`,
-//! row 0 → 0, row 1 → 1, …) for documentIds and join the two by `.ci`.
+//! We denormalize all three tables into one `Vec<QtInputRow>` (one row
+//! per `.ci`), looking up each of the 9 grid variables via
+//! `main_data[(ci, ri_for_variable)]`. R does the same thing via two
+//! `left_join`s in main.R:367-379.
 //!
-//! Output shape mirrors the R operator's iteration model: **one chip
-//! per `.ci`** — even if multiple `.ci`s share an image-ZIP documentId.
-//! R does `group_by(.ci) %>% group_walk(prep_grid_files)` then one
-//! MATLAB invocation per `.ci` with that single image, so the result
-//! table has one distinct `grdImageNameUsed` per input image. We mirror
-//! that here, while still deduplicating ZIP downloads at stage 4 so
-//! multiple images from one ZIP only fetch the file once.
+//! Required column factors: `grdImageNameUsed`, `Image`, `spotRow`,
+//! `spotCol`, `ID` (plus 1-2 `documentId` columns).
+//!
+//! Required row factor: `variable` carrying all 9 of `gridX`, `gridY`,
+//! `diameter`, `grdRotation`, `grdXFixedPosition`, `grdYFixedPosition`,
+//! `bad`, `empty`, `manual` (matching `req.variables` at R main.R:355).
+//!
+//! Errors loudly when the input shape doesn't match — wrong number of
+//! doc-ID columns, missing factors, missing variables, etc.
 
 use anyhow::{anyhow, bail, Context, Result};
 use polars::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 use tercen_rs::context::ContextBase;
 use tercen_rs::tson_to_dataframe;
 
-/// One image-row of the operator's input table, decoded into native Rust types.
+/// The 9 variables we need from the gathered grid output. Matches
+/// `req.variables` at R main.R:355.
+pub const REQUIRED_VARIABLES: &[&str] = &[
+    "gridX",
+    "gridY",
+    "diameter",
+    "grdRotation",
+    "grdXFixedPosition",
+    "grdYFixedPosition",
+    "bad",
+    "empty",
+    "manual",
+];
+
+/// One column-facet row (one `(image × spot)` combination) fully
+/// denormalized with all 9 gathered variables looked up from the main
+/// data table.
 #[derive(Debug, Clone)]
-pub struct InputRow {
-    /// Implicit `.ci` for this row — the row index in the column-facet
-    /// table (which equals the crosstab column index). The unit of work:
-    /// one chip = one `.ci` = one image (matches R `group_by(.ci)`).
+pub struct QtInputRow {
+    /// Crosstab column index — positional row index in the column-facet
+    /// table. The unit of work for output table construction: one
+    /// `(image × spot)` per `.ci`.
     pub ci: i32,
-    /// Filename stem of this image, taken from the first label factor.
-    pub image_label: String,
-    /// Document IDs referenced by this row (1 or 2 values, in the order
-    /// the doc-ID columns appear in the schema). The first one is
-    /// conventionally the image ZIP; the second, if present, is the
-    /// array-layout text file. Same convention as the R operator's
-    /// `prep_image_folder()` (`aux_functions.R:26-79`).
+    /// Document IDs referenced by this row (1 or 2 values). The first
+    /// is the image ZIP; the second, if present, is the array-layout
+    /// text file.
     pub document_ids: Vec<String>,
+    /// `grdImageNameUsed` — the chip's reference image (constant across
+    /// all `.ci`s belonging to the same chip).
+    pub grd_image_name: String,
+    /// `Image` — the filename stem of this individual image.
+    pub image_label: String,
+    /// `spotRow` (integer grid row).
+    pub spot_row: i32,
+    /// `spotCol` (integer grid column).
+    pub spot_col: i32,
+    /// `ID` — spot identifier (peptide name, `#REF`, …).
+    pub spot_id: String,
+    // 9 gathered variables. Within a chip these are constant across
+    // images per spot — same `(spotRow, spotCol)` always yields the
+    // same values regardless of which `.ci`'s image we look at.
+    pub grid_x: f64,
+    pub grid_y: f64,
+    pub diameter: f64,
+    pub rotation: f64,
+    pub grd_x_fixed: f64,
+    pub grd_y_fixed: f64,
+    /// `bad` — R round-trips through `as.double(as.logical(...))`; we
+    /// keep the same f64 representation (0.0 or 1.0).
+    pub bad: f64,
+    pub empty: f64,
+    pub manual: f64,
 }
 
-/// All rows from the input table, plus the schema introspection we
-/// did along the way (doc-ID column names + label factor name). Rows
-/// are ordered by `.ci` ascending — one row per crosstab column = one
-/// chip group of one image.
+/// All denormalized input rows + schema introspection results.
 #[derive(Debug, Clone)]
 pub struct InputData {
-    /// One row per crosstab column, ordered by `.ci`.
-    pub rows: Vec<InputRow>,
-    /// Names of the documentId columns we found in the schema, in
+    /// One row per `.ci`, ordered by `.ci` ascending.
+    pub rows: Vec<QtInputRow>,
+    /// Names of the documentId columns in the column-facet schema, in
     /// schema order. `len()` is always 1 or 2.
     pub document_id_columns: Vec<String>,
-    /// Name of the label factor used for `image_label`.
-    pub label_column: String,
 }
 
 impl InputData {
-    /// One chip-group per `.ci` (one chip = one image, matching R).
-    pub fn n_groups(&self) -> usize {
-        self.rows.len()
-    }
-
-    /// Total number of image rows. Equal to `n_groups()` in this shape;
-    /// kept as a separate accessor so callers stay decoupled from the
-    /// invariant in case future versions allow multi-image chips.
+    /// Number of `(image × spot)` rows in the input.
     pub fn n_rows(&self) -> usize {
         self.rows.len()
     }
 
-    /// Set of unique documentIds across all rows — every entry needs to
-    /// be downloaded once at stage 4. Includes both primary (image ZIP)
-    /// and secondary (optional layout file) doc-ids.
+    /// Number of distinct chips (unique `grdImageNameUsed` values).
+    pub fn n_chips(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for r in &self.rows {
+            seen.insert(r.grd_image_name.as_str());
+        }
+        seen.len()
+    }
+
+    /// Every unique documentId across all rows (image ZIPs and the
+    /// optional layout file). Stage 4 downloads each once.
     pub fn unique_document_ids(&self) -> BTreeSet<String> {
         self.rows
             .iter()
@@ -86,35 +124,37 @@ impl InputData {
     }
 }
 
-/// Load the operator's input by joining the column-facet table (for
-/// documentIds, indexed positionally by `.ci`) with the main data table
-/// (for labels, keyed explicitly by `.ci`).
-///
-/// Errors loudly (no fallbacks) when the input shape doesn't match the
-/// R operator's contract — wrong number of doc-ID columns, missing
-/// label factor, empty tables, etc.
-///
-/// Takes `&ContextBase` rather than the `TercenContext` trait so we can
-/// call `ctx.streamer()` and `ctx.cnames()` (which live on the concrete
-/// base, not on the abstract trait). Both `ProductionContext` and
-/// `DevContext` `Deref<Target = ContextBase>`, so callers can pass
-/// `&ctx` where `ctx` is either — Rust's deref coercion takes care
-/// of the conversion.
+/// Required (un-namespaced) column-facet factor names. The schema names
+/// actually carry a namespace prefix (e.g. `ds1.grdImageNameUsed`), so
+/// we look them up by `endsWith` — same as R main.R:331-335.
+const REQUIRED_CNAMES: &[&str] = &["grdImageNameUsed", "Image", "spotRow", "spotCol", "ID"];
+
+/// Stream the three input tables and denormalize them into
+/// `Vec<QtInputRow>`. See module-level docs for the full pipeline.
 pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
-    // Identify the column-facet table — that's where the documentId
-    // columns live.
     let col_table_id = ctx.cube_query().column_hash.clone();
+    let row_table_id = ctx.cube_query().row_hash.clone();
+    let qt_table_id = ctx.cube_query().qt_hash.clone();
+
     if col_table_id.is_empty() {
         bail!(
             "operator has no column-facet table (cube_query.column_hash is empty). \
-             The pamsoft_grid_operator expects at least one column factor — the \
-             documentId column carrying the image ZIP reference."
+             The QT operator expects column factors carrying grdImageNameUsed, \
+             Image, spotRow, spotCol, ID, plus 1-2 documentId columns."
         );
     }
+    if row_table_id.is_empty() {
+        bail!(
+            "operator has no row-facet table (cube_query.row_hash is empty). \
+             The QT operator expects a 'variable' row factor from an upstream \
+             Gather step on the pamsoft_grid output."
+        );
+    }
+    if qt_table_id.is_empty() {
+        bail!("operator has no main data table (cube_query.qt_hash is empty).");
+    }
 
-    // Schema introspection: enumerate column-facet column names and find
-    // the documentId column(s) by name substring (matches the R operator's
-    // `grepl("documentId", x)` heuristic at `main.R:190-192`).
+    // --- Resolve all required column-facet factor names by endsWith ---
     let all_cnames = ctx
         .cnames()
         .await
@@ -126,158 +166,269 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         .collect();
     if document_id_columns.is_empty() || document_id_columns.len() > 2 {
         bail!(
-            "expected 1 or 2 documentId columns on the column-facet table, found {} ({:?}). \
-             Workflow-side: add a documentId-typed factor that references the image ZIP \
-             (and optionally a second one for the array-layout file).",
+            "expected 1 or 2 documentId columns on the column-facet table, found {} ({:?})",
             document_id_columns.len(),
             document_id_columns,
         );
     }
+    let resolved_cnames: Vec<String> = REQUIRED_CNAMES
+        .iter()
+        .map(|req| {
+            all_cnames
+                .iter()
+                .find(|c| c.ends_with(req) || c.as_str() == *req)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "required column factor '{}' not found on column-facet \
+                         (available: {:?}). Make sure the upstream Gather step \
+                         keeps grdImageNameUsed, Image, spotRow, spotCol, and ID \
+                         as column factors.",
+                        req,
+                        all_cnames,
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    // The label factor name comes from the first axis query's `labels`.
-    // The R operator uses `ctx$labels[[1]]` (the first one) as the image
-    // filename per row.
-    let label_column = ctx
-        .cube_query()
-        .axis_queries
-        .first()
-        .and_then(|aq| aq.labels.first())
+    // --- Resolve 'variable' on the row facet ---
+    let all_rnames = ctx
+        .rnames()
+        .await
+        .map_err(|e| anyhow!("fetch row-facet schema: {e}"))?;
+    let variable_col = all_rnames
+        .iter()
+        .find(|r| r.ends_with("variable") || r.as_str() == "variable")
+        .cloned()
         .ok_or_else(|| {
             anyhow!(
-                "no label factor on the input — the operator needs a label \
-                 factor on the y-axis projection carrying each image's \
-                 filename stem (matches the R operator's `ctx$labels[[1]]`)."
+                "required row factor 'variable' not found (available: {:?}). \
+                 Add a Gather step upstream that turns the grid output's \
+                 numeric columns into a 'variable' row factor.",
+                all_rnames,
             )
-        })?
-        .name
-        .clone();
+        })?;
 
-    // --- Stream column-facet for documentIds (one row per .ci) ---
+    // --- Stream column-facet ---
     let streamer = ctx.streamer();
+    let mut col_cols: Vec<String> = resolved_cnames.clone();
+    col_cols.extend(document_id_columns.iter().cloned());
     let col_tson = streamer
-        .stream_tson(
-            &col_table_id,
-            Some(document_id_columns.clone()),
-            0,
-            -1,
-        )
+        .stream_tson(&col_table_id, Some(col_cols.clone()), 0, -1)
         .await
         .map_err(|e| anyhow!("stream column-facet table {col_table_id}: {e}"))?;
     let col_df = tson_to_dataframe(&col_tson).context("parse TSON column-facet payload")?;
 
-    let doc_cols: Vec<Series> = document_id_columns
-        .iter()
-        .map(|name| {
-            col_df
-                .column(name)
-                .map_err(|e| anyhow!("missing documentId column '{}': {}", name, e))
-                .and_then(|s| s.cast(&DataType::String).context("cast doc id to string"))
-                .map(|c| c.take_materialized_series())
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let doc_series: Vec<&StringChunked> = doc_cols
-        .iter()
-        .map(|s| s.str().context("documentId is not string"))
-        .collect::<Result<Vec<_>>>()?;
-    let n_cols = doc_series
-        .first()
-        .map(|s| s.len())
-        .unwrap_or(0);
+    let n_cols = col_df.height();
     if n_cols == 0 {
-        bail!(
-            "column-facet table is empty — no images to process. Check the \
-             workflow's input step produces at least one row."
-        );
+        bail!("column-facet table is empty — no (image × spot) rows to process.");
     }
 
-    // --- Stream main data table for `.ci` + label (broadcast per cell) ---
-    // Pick the first non-null label per `.ci`. The label is constant
-    // across `.ri` for a given `.ci` by construction (it's a column-level
-    // attribute), so the first non-null seen is the answer.
-    let qt_table_id = ctx.cube_query().qt_hash.clone();
-    if qt_table_id.is_empty() {
-        bail!(
-            "operator has no main data table (cube_query.qt_hash is empty). \
-             This shouldn't happen for a normal crosstab — re-check the workflow."
-        );
+    // Materialize all the typed series once. We hold owned `Series`
+    // (not borrowed) so the chunked accessors below stay valid through
+    // the per-row loop.
+    let grd_image_s = owned_str(&col_df, &resolved_cnames[0])?;
+    let image_s = owned_str(&col_df, &resolved_cnames[1])?;
+    let spot_row_s = owned_i32(&col_df, &resolved_cnames[2])?;
+    let spot_col_s = owned_i32(&col_df, &resolved_cnames[3])?;
+    let spot_id_s = owned_str(&col_df, &resolved_cnames[4])?;
+    let doc_series: Vec<Series> = document_id_columns
+        .iter()
+        .map(|name| owned_str(&col_df, name))
+        .collect::<Result<Vec<_>>>()?;
+
+    // --- Stream row-facet: variable per .ri (positional) ---
+    let row_tson = streamer
+        .stream_tson(&row_table_id, Some(vec![variable_col.clone()]), 0, -1)
+        .await
+        .map_err(|e| anyhow!("stream row-facet table {row_table_id}: {e}"))?;
+    let row_df = tson_to_dataframe(&row_tson).context("parse TSON row-facet payload")?;
+    let n_var_rows = row_df.height();
+    if n_var_rows == 0 {
+        bail!("row-facet table is empty — no gathered variables to process.");
     }
+    let var_s = owned_str(&row_df, &variable_col)?;
+    let var_chunked = var_s.str().context("variable is not string")?;
+    // Build `variable_name → ri`. Strip namespace prefix (e.g.
+    // `"ds1.gridX"` → `"gridX"`) — R main.R:379 does the same via
+    // `stri_split_fixed(..., ".", 2)[,2]`.
+    let mut variable_to_ri: HashMap<String, i32> = HashMap::with_capacity(n_var_rows);
+    for ri in 0..n_var_rows {
+        let v = var_chunked
+            .get(ri)
+            .ok_or_else(|| anyhow!("null variable value at .ri={ri}"))?;
+        variable_to_ri.insert(strip_namespace(v).to_string(), ri as i32);
+    }
+    // Sanity-check that every required variable is present.
+    for req in REQUIRED_VARIABLES {
+        if !variable_to_ri.contains_key(*req) {
+            let mut found: Vec<&str> = variable_to_ri.keys().map(String::as_str).collect();
+            found.sort_unstable();
+            bail!(
+                "required variable '{}' not found in row-facet (got: {:?}). \
+                 The upstream Gather step must include all 9 of {:?}.",
+                req,
+                found,
+                REQUIRED_VARIABLES,
+            );
+        }
+    }
+
+    // --- Stream main data table ---
     let qt_tson = streamer
         .stream_tson(
             &qt_table_id,
-            Some(vec![".ci".to_string(), label_column.clone()]),
+            Some(vec![".ci".to_string(), ".ri".to_string(), ".y".to_string()]),
             0,
             -1,
         )
         .await
-        .map_err(|e| {
-            anyhow!(
-                "stream main data table {qt_table_id} for .ci + label '{label_column}': {e}. \
-                 Available main-table columns may be different; the label factor must be \
-                 a label on axis_queries[0] and present on the main data."
-            )
-        })?;
+        .map_err(|e| anyhow!("stream main data table {qt_table_id}: {e}"))?;
     let qt_df = tson_to_dataframe(&qt_tson).context("parse TSON main-table payload")?;
+    let ci_s = owned_i32(&qt_df, ".ci")?;
+    let ri_s = owned_i32(&qt_df, ".ri")?;
+    let y_col = qt_df
+        .column(".y")
+        .map_err(|e| anyhow!("missing .y column on main table: {e}"))?
+        .cast(&DataType::Float64)
+        .context("cast .y to float64")?;
+    let y_s = y_col.take_materialized_series();
 
-    let ci_col = qt_df
-        .column(".ci")
-        .map_err(|e| anyhow!("missing .ci column on main table: {e}"))?
-        .cast(&DataType::Int32)
-        .context("cast .ci to int32")?;
-    let label_col = qt_df
-        .column(&label_column)
-        .map_err(|e| anyhow!("missing label column '{}' on main table: {}", label_column, e))?
-        .cast(&DataType::String)
-        .context("cast label column to string")?;
-    let ci_chunked = ci_col.i32().context(".ci is not int32")?;
-    let label_chunked = label_col.str().context("label is not string")?;
+    let ci_chunked = ci_s.i32().context(".ci is not int32")?;
+    let ri_chunked = ri_s.i32().context(".ri is not int32")?;
+    let y_chunked = y_s.f64().context(".y is not float64")?;
 
-    let mut ci_to_label: BTreeMap<i32, String> = BTreeMap::new();
-    for (ci_opt, lbl_opt) in ci_chunked.into_iter().zip(label_chunked.into_iter()) {
-        let (Some(ci), Some(lbl)) = (ci_opt, lbl_opt) else {
+    // Build a HashMap<(ci, ri) → .y>. Skip null cells (Tercen materializes
+    // sparse data with NaNs / nulls; missing-variable rows propagate as
+    // NaN through the algorithm, matching R behaviour).
+    let mut yy: HashMap<(i32, i32), f64> = HashMap::with_capacity(qt_df.height());
+    for ((ci_opt, ri_opt), y_opt) in ci_chunked
+        .into_iter()
+        .zip(ri_chunked.into_iter())
+        .zip(y_chunked.into_iter())
+    {
+        let (Some(ci), Some(ri), Some(y)) = (ci_opt, ri_opt, y_opt) else {
             continue;
         };
-        ci_to_label.entry(ci).or_insert_with(|| lbl.to_string());
+        yy.insert((ci, ri), y);
     }
-    if ci_to_label.is_empty() {
-        bail!(
-            "main data table yielded zero (.ci, label) pairs — label column \
-             '{label_column}' appears to be all-null on qt_hash. Check that the \
-             label factor is wired into the workflow."
-        );
+    if yy.is_empty() {
+        bail!("main data table yielded zero non-null (.ci, .ri, .y) tuples.");
     }
 
-    // --- Join: for each column-facet row (positional .ci), pull its label ---
+    // --- Denormalize ---
+    let grd_image_chunked = grd_image_s.str().context("grdImageNameUsed is not string")?;
+    let image_chunked = image_s.str().context("Image is not string")?;
+    let spot_row_chunked = spot_row_s.i32().context("spotRow is not int32")?;
+    let spot_col_chunked = spot_col_s.i32().context("spotCol is not int32")?;
+    let spot_id_chunked = spot_id_s.str().context("ID is not string")?;
+    let doc_chunked: Vec<&StringChunked> = doc_series
+        .iter()
+        .map(|s| s.str().context("documentId is not string"))
+        .collect::<Result<Vec<_>>>()?;
+
+    let ri_grid_x = variable_to_ri["gridX"];
+    let ri_grid_y = variable_to_ri["gridY"];
+    let ri_diameter = variable_to_ri["diameter"];
+    let ri_rotation = variable_to_ri["grdRotation"];
+    let ri_xfix = variable_to_ri["grdXFixedPosition"];
+    let ri_yfix = variable_to_ri["grdYFixedPosition"];
+    let ri_bad = variable_to_ri["bad"];
+    let ri_empty = variable_to_ri["empty"];
+    let ri_manual = variable_to_ri["manual"];
+
     let mut rows = Vec::with_capacity(n_cols);
-    for row_idx in 0..n_cols {
-        let ci = row_idx as i32;
-        let image_label = ci_to_label
-            .get(&ci)
-            .ok_or_else(|| {
-                anyhow!(
-                    "no label found in main table for .ci={ci} (column-facet has \
-                     {n_cols} rows but main table is missing this column). The \
-                     workflow may have an empty column."
-                )
-            })?
-            .clone();
-        let document_ids: Vec<String> = doc_series
+    for ci_usize in 0..n_cols {
+        let ci = ci_usize as i32;
+        let grd_image_name = grd_image_chunked
+            .get(ci_usize)
+            .ok_or_else(|| anyhow!("null grdImageNameUsed at .ci={ci}"))?
+            .to_string();
+        let image_label = image_chunked
+            .get(ci_usize)
+            .ok_or_else(|| anyhow!("null Image at .ci={ci}"))?
+            .to_string();
+        let spot_row = spot_row_chunked
+            .get(ci_usize)
+            .ok_or_else(|| anyhow!("null spotRow at .ci={ci}"))?;
+        let spot_col = spot_col_chunked
+            .get(ci_usize)
+            .ok_or_else(|| anyhow!("null spotCol at .ci={ci}"))?;
+        let spot_id = spot_id_chunked
+            .get(ci_usize)
+            .ok_or_else(|| anyhow!("null ID at .ci={ci}"))?
+            .to_string();
+        let document_ids: Vec<String> = doc_chunked
             .iter()
             .map(|s| {
-                s.get(row_idx)
+                s.get(ci_usize)
                     .ok_or_else(|| anyhow!("null documentId at .ci={ci}"))
                     .map(String::from)
             })
             .collect::<Result<Vec<_>>>()?;
-        rows.push(InputRow {
+
+        let lookup = |label: &str, ri: i32| -> Result<f64> {
+            yy.get(&(ci, ri)).copied().ok_or_else(|| {
+                anyhow!(
+                    "missing .y for (.ci={ci}, .ri={ri}, variable='{label}'). The main \
+                     data table is sparse here; the upstream Gather step should produce \
+                     a full (.ci × .ri) cross product."
+                )
+            })
+        };
+
+        rows.push(QtInputRow {
             ci,
-            image_label,
             document_ids,
+            grd_image_name,
+            image_label,
+            spot_row,
+            spot_col,
+            spot_id,
+            grid_x: lookup("gridX", ri_grid_x)?,
+            grid_y: lookup("gridY", ri_grid_y)?,
+            diameter: lookup("diameter", ri_diameter)?,
+            rotation: lookup("grdRotation", ri_rotation)?,
+            grd_x_fixed: lookup("grdXFixedPosition", ri_xfix)?,
+            grd_y_fixed: lookup("grdYFixedPosition", ri_yfix)?,
+            bad: lookup("bad", ri_bad)?,
+            empty: lookup("empty", ri_empty)?,
+            manual: lookup("manual", ri_manual)?,
         });
     }
 
     Ok(InputData {
         rows,
         document_id_columns,
-        label_column,
     })
+}
+
+/// Strip the dataset-namespace prefix from a variable name, e.g.
+/// `"ds1.gridX"` → `"gridX"`. Mirrors R main.R:379. If no `.` is
+/// present, returns the input unchanged (safer than R's behaviour,
+/// which silently produces `""`).
+fn strip_namespace(s: &str) -> &str {
+    s.split_once('.').map(|(_, rest)| rest).unwrap_or(s)
+}
+
+/// Pull a string column out of a `DataFrame` as an owned `Series`,
+/// casting if necessary. The owned `Series` is needed because polars'
+/// `&StringChunked` accessors borrow from a `Series` that has to
+/// outlive them.
+fn owned_str(df: &DataFrame, name: &str) -> Result<Series> {
+    let col = df
+        .column(name)
+        .map_err(|e| anyhow!("missing column '{}': {}", name, e))?
+        .cast(&DataType::String)
+        .with_context(|| format!("cast column '{}' to string", name))?;
+    Ok(col.take_materialized_series())
+}
+
+fn owned_i32(df: &DataFrame, name: &str) -> Result<Series> {
+    let col = df
+        .column(name)
+        .map_err(|e| anyhow!("missing column '{}': {}", name, e))?
+        .cast(&DataType::Int32)
+        .with_context(|| format!("cast column '{}' to int32", name))?;
+    Ok(col.take_materialized_series())
 }

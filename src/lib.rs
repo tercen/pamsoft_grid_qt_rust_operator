@@ -101,10 +101,10 @@ async fn execute(ctx: &ContextBase, task_id: Option<&str>) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("load input table: {e:#}"))?;
     tracing::info!(
-        n_chips = input_data.n_groups(),
+        n_rows = input_data.n_rows(),
+        n_chips = input_data.n_chips(),
         doc_id_cols = ?input_data.document_id_columns,
-        label_col = input_data.label_column,
-        "input table loaded (one chip per .ci)"
+        "input table loaded ((image × spot) rows pivoted from the melted grid input)"
     );
 
     // Stage 4: download every unique documentId once and index TIFFs by
@@ -125,19 +125,25 @@ async fn execute(ctx: &ContextBase, task_id: Option<&str>) -> Result<()> {
         "input files ready on disk"
     );
 
-    // Stage 5: run the grid algorithm per .ci (one chip = one image).
-    let group_results =
-        algorithm::run_grid_per_group(&input_data, &catalogue, &layout_path, &pamsoft_props)
-            .map_err(|e| anyhow::anyhow!("grid algorithm: {e:#}"))?;
-    let total_spots: usize = group_results.iter().map(|g| g.spots.len()).sum();
+    // Stage 5: run the QT algorithm per chip (one chip = many images +
+    // one grid, matching R's group_by(grdImageNameUsed)).
+    let chip_results = algorithm::run_quant_per_chip(
+        &input_data,
+        &catalogue,
+        &layout_path,
+        &pamsoft_props,
+        &work_root,
+    )
+    .map_err(|e| anyhow::anyhow!("QT algorithm: {e:#}"))?;
+    let total_results: usize = chip_results.iter().map(|c| c.results.len()).sum();
     tracing::info!(
-        n_groups = group_results.len(),
-        total_spots,
-        "grid algorithm complete"
+        n_chips = chip_results.len(),
+        total_results,
+        "QT algorithm complete"
     );
 
     // Stage 6: build the Polars result DataFrame.
-    let df = output::build_result_df(&group_results, ctx.namespace())
+    let df = output::build_result_df(&chip_results, ctx.namespace(), pamsoft_props.is_diagnostic)
         .map_err(|e| anyhow::anyhow!("build result DataFrame: {e:#}"))?;
     tracing::info!(
         n_rows = df.height(),
