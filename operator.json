@@ -1,0 +1,154 @@
+{
+  "name": "pamsoft_grid_qt_rust_operator",
+  "description": "PamSoft quantification operator. Rust port of the original MATLAB MCR implementation. Takes the melted output of the pamsoft_grid step (joined with the source images) and produces per-spot quantification stats.",
+  "tags": ["image analysis"],
+  "communicationProtocol": "grpc",
+  "authors": ["Tercen", "Thiago"],
+  "urls": ["https://github.com/tercen/pamsoft_grid_qt_rust_operator"],
+  "container": "pamgene/pamsoft_grid_qt_rust_operator:latest",
+  "properties": [
+    {
+      "kind": "DoubleProperty",
+      "name": "Min Diameter",
+      "defaultValue": 0.45,
+      "description": "Lower bound for the segmented spot diameter, as a fraction of grdSpotPitch.",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "Max Diameter",
+      "defaultValue": 0.85,
+      "description": "Upper bound for the segmented spot diameter, as a fraction of grdSpotPitch.",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "Saturation Limit",
+      "defaultValue": 4095,
+      "description": "Pixel intensity above which a pixel is considered saturated.",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "Spot Pitch",
+      "defaultValue": 0,
+      "description": "Distance between adjacent spots in pixels. 0 = auto-detect from image dimensions (17 for Evolve3, 21.5 for Evolve2).",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "EdgeSensitivityLow",
+      "defaultValue": 0,
+      "description": "Canny edge low threshold (fractional). The R operator hardcodes 0 here; the Rust port exposes it so it can actually be tuned.",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "Edge Sensitivity",
+      "defaultValue": 0.05,
+      "description": "Canny edge high threshold (fractional).",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "Spot Size",
+      "defaultValue": 0.66,
+      "description": "Spot radius as a fraction of grdSpotPitch.",
+      "values": {}
+    },
+    {
+      "kind": "EnumeratedProperty",
+      "name": "Segmentation Method",
+      "defaultValue": "Edge",
+      "description": "Per-spot segmentation algorithm.",
+      "values": ["Edge", "Hough"]
+    },
+    {
+      "kind": "StringProperty",
+      "name": "Rotation",
+      "defaultValue": "-2:0.25:2",
+      "description": "Template rotation candidates in MATLAB seq() syntax 'min:step:max' (e.g. -2:0.25:2). A single value triggers MATLAB's imregister2 path which is known to hallucinate large rotations — use a vector for production parity.",
+      "values": {}
+    },
+    {
+      "kind": "EnumeratedProperty",
+      "name": "Diagnostic Output",
+      "defaultValue": "Yes",
+      "description": "When 'No', the result table drops the diagnostic-only columns (Bad_Spot, Diameter, Empty_Spot, Fraction_Ignored, Position_Offset, Replaced_Spot, Mean_Background, Mean_SigmBg, Mean_Signal) — matching the R operator's behaviour.",
+      "values": ["Yes", "No"]
+    }
+  ],
+  "operatorSpec": {
+    "kind": "OperatorSpec",
+    "ontologyUri": "https://tercen.com/_ontology/tercen",
+    "ontologyVersion": "0.0.1",
+    "inputSpecs": [
+      {
+        "kind": "CrosstabSpec",
+        "metaFactors": [
+          {
+            "kind": "MetaFactor",
+            "name": "Documents",
+            "type": "",
+            "description": "documentId column(s) referencing the input file(s): the image ZIP (and optionally the array-layout text file as a second documentId). 1 or 2 columns.",
+            "ontologyMapping": "documentId",
+            "crosstabMapping": "column",
+            "cardinality": "1..2",
+            "factors": []
+          },
+          {
+            "kind": "MetaFactor",
+            "name": "Grid Reference Image",
+            "type": "",
+            "description": "grdImageNameUsed — the chip's reference image (constant per chip across cycles/exposures). Comes from the upstream pamsoft_grid step.",
+            "ontologyMapping": "sample",
+            "crosstabMapping": "column",
+            "cardinality": "1..1",
+            "factors": []
+          },
+          {
+            "kind": "MetaFactor",
+            "name": "Image",
+            "type": "",
+            "description": "Image — filename stem of each individual image (one per .ci).",
+            "ontologyMapping": "sample",
+            "crosstabMapping": "column",
+            "cardinality": "1..1",
+            "factors": []
+          },
+          {
+            "kind": "MetaFactor",
+            "name": "Grid Coordinates",
+            "type": "",
+            "description": "spotRow and spotCol — the integer grid row/column for each spot (also from upstream pamsoft_grid).",
+            "ontologyMapping": "",
+            "crosstabMapping": "column",
+            "cardinality": "2..2",
+            "factors": []
+          },
+          {
+            "kind": "MetaFactor",
+            "name": "Spot ID",
+            "type": "",
+            "description": "ID — the spot identifier (e.g. peptide name, #REF for reference spots).",
+            "ontologyMapping": "",
+            "crosstabMapping": "column",
+            "cardinality": "1..1",
+            "factors": []
+          },
+          {
+            "kind": "MetaFactor",
+            "name": "Variable",
+            "type": "",
+            "description": "variable — the name of the gathered grid output column (gridX, gridY, diameter, grdRotation, grdXFixedPosition, grdYFixedPosition, bad, empty, manual). Produced by the upstream Gather/Melt step.",
+            "ontologyMapping": "",
+            "crosstabMapping": "row",
+            "cardinality": "1..1",
+            "factors": []
+          }
+        ]
+      }
+    ],
+    "outputSpecs": []
+  }
+}
