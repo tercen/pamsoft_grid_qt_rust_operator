@@ -1,0 +1,10 @@
+# Tercen Python SDK — connects to a Tercen instance and exposes the
+# same workflow / step / table APIs that the R operators use.
+tercen_python_client @ git+https://github.com/tercen/tercen_python_client@main
+
+# Tabular diffing. The Rust dev binary writes Polars-format CSVs; we
+# stay in Polars on the comparison side so we don't go through pandas.
+polars==0.20.*
+
+# CLI ergonomics + structured config.
+PyYAML==6.0.*
