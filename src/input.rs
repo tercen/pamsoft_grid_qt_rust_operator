@@ -367,15 +367,13 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let lookup = |label: &str, ri: i32| -> Result<f64> {
-            yy.get(&(ci, ri)).copied().ok_or_else(|| {
-                anyhow!(
-                    "missing .y for (.ci={ci}, .ri={ri}, variable='{label}'). The main \
-                     data table is sparse here; the upstream Gather step should produce \
-                     a full (.ci × .ri) cross product."
-                )
-            })
-        };
+        // Sparse cells (null .y) become NaN — matches R's `left_join`
+        // behaviour. The upstream grid step legitimately emits NaN for
+        // spots it couldn't place (empty/bad/replaced spots), and
+        // Tercen materializes those as null cells that `tson_to_dataframe`
+        // skips. Don't bail here; downstream consumers (the grid CSV
+        // writer + the QT algorithm) handle NaN correctly.
+        let lookup = |ri: i32| -> f64 { yy.get(&(ci, ri)).copied().unwrap_or(f64::NAN) };
 
         rows.push(QtInputRow {
             ci,
@@ -385,15 +383,15 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
             spot_row,
             spot_col,
             spot_id,
-            grid_x: lookup("gridX", ri_grid_x)?,
-            grid_y: lookup("gridY", ri_grid_y)?,
-            diameter: lookup("diameter", ri_diameter)?,
-            rotation: lookup("grdRotation", ri_rotation)?,
-            grd_x_fixed: lookup("grdXFixedPosition", ri_xfix)?,
-            grd_y_fixed: lookup("grdYFixedPosition", ri_yfix)?,
-            bad: lookup("bad", ri_bad)?,
-            empty: lookup("empty", ri_empty)?,
-            manual: lookup("manual", ri_manual)?,
+            grid_x: lookup(ri_grid_x),
+            grid_y: lookup(ri_grid_y),
+            diameter: lookup(ri_diameter),
+            rotation: lookup(ri_rotation),
+            grd_x_fixed: lookup(ri_xfix),
+            grd_y_fixed: lookup(ri_yfix),
+            bad: lookup(ri_bad),
+            empty: lookup(ri_empty),
+            manual: lookup(ri_manual),
         });
     }
 
