@@ -284,92 +284,14 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         )
         .await
         .map_err(|e| anyhow!("stream main data table {qt_table_id}: {e}"))?;
-    let qt_df = tson_to_dataframe(&qt_tson).context("parse TSON main-table payload")?;
-    tracing::info!(
-        qt_table_id = %qt_table_id,
-        df_height = qt_df.height(),
-        df_width = qt_df.width(),
-        df_columns = ?qt_df.get_column_names(),
-        "QT main data DataFrame parsed"
-    );
-    // Diagnostic: print per-column lengths. If `.y` ends up shorter than
-    // `.ci`/`.ri`, the zip iterator below will truncate and we'd silently
-    // miss rows for high .ci values.
-    for col_name in [".ci", ".ri", ".y"] {
-        if let Ok(c) = qt_df.column(col_name) {
-            tracing::info!(col = col_name, len = c.len(), null_count = c.null_count(), "QT main column");
-        }
-    }
-    let ci_s = owned_i32(&qt_df, ".ci")?;
-    let ri_s = owned_i32(&qt_df, ".ri")?;
-    let y_col = qt_df
-        .column(".y")
-        .map_err(|e| anyhow!("missing .y column on main table: {e}"))?
-        .cast(&DataType::Float64)
-        .context("cast .y to float64")?;
-    let y_s = y_col.take_materialized_series();
-
-    let ci_chunked = ci_s.i32().context(".ci is not int32")?;
-    let ri_chunked = ri_s.i32().context(".ri is not int32")?;
-    let y_chunked = y_s.f64().context(".y is not float64")?;
-
-    // Defensive: require all three columns to have the same length, OR
-    // bail loudly. Production hit a bug where chips 11+ ended up with
-    // grid_x=NaN even though the MCP export of the same main-data
-    // table showed finite values for those cells — the most likely
-    // explanation being that `tson_to_dataframe` decoded `.y` to a
-    // shorter array than `.ci`/`.ri`, and the previous zip-based
-    // iteration silently truncated.
-    let n_ci = ci_chunked.len();
-    let n_ri = ri_chunked.len();
-    let n_y = y_chunked.len();
-    if !(n_ci == n_ri && n_ri == n_y) {
-        bail!(
-            "main data table columns have mismatched lengths: \
-             .ci={n_ci}, .ri={n_ri}, .y={n_y}. This usually means the \
-             TSON encoding decoded `.y` differently than the index \
-             columns — try requesting the table via a different API."
-        );
-    }
-    let total_rows = n_ci;
-    tracing::info!(total_rows, "QT main-data row count (all columns match)");
-
-    // Build a HashMap<(ci, ri) → .y> via positional indexing. Polars'
-    // chunked `.get(i)` returns `Option<T>` and handles out-of-bounds
-    // by returning `None` rather than panicking; we already bailed if
-    // the columns disagree on length so positional access is safe.
-    let mut yy: HashMap<(i32, i32), f64> = HashMap::with_capacity(total_rows);
-    let mut n_ci_null = 0usize;
-    let mut n_ri_null = 0usize;
-    let mut n_y_null = 0usize;
-    let mut n_y_nan = 0usize;
-    let mut last_some_y_at: Option<usize> = None;
-    let mut first_none_y_at: Option<usize> = None;
-    for i in 0..total_rows {
-        let ci_v = ci_chunked.get(i);
-        let ri_v = ri_chunked.get(i);
-        let y_v = y_chunked.get(i);
-        if ci_v.is_none() { n_ci_null += 1; }
-        if ri_v.is_none() { n_ri_null += 1; }
-        if y_v.is_none() {
-            n_y_null += 1;
-            if first_none_y_at.is_none() { first_none_y_at = Some(i); }
-        } else {
-            last_some_y_at = Some(i);
-            if y_v.unwrap().is_nan() { n_y_nan += 1; }
-        }
-        let (Some(ci), Some(ri), Some(y)) = (ci_v, ri_v, y_v) else { continue; };
-        yy.insert((ci, ri), y);
-    }
-    tracing::info!(
-        n_ci_null,
-        n_ri_null,
-        n_y_null,
-        n_y_nan,
-        first_none_y_at = ?first_none_y_at,
-        last_some_y_at = ?last_some_y_at,
-        "QT main column null/NaN counts"
-    );
+    // Manual TSON decode: tercen-rs' `tson_to_dataframe` reads
+    // `col["data"]` per column, but the Tercen TSON encoding uses
+    // `col["values"]` (confirmed by reading rustson's test fixtures +
+    // the Python SDK's `tson_to_polars`). The wrong key produces a
+    // short / null-padded `.y` column past ~14976 rows on this dataset,
+    // which is the bug that made every chip 11+ NaN-fill in the
+    // operator's QT output.
+    let yy = decode_main_data_yy(&qt_tson).context("decode QT main-data TSON")?;
     if yy.is_empty() {
         bail!("main data table yielded zero non-null (.ci, .ri, .y) tuples.");
     }
@@ -515,4 +437,122 @@ fn owned_i32(df: &DataFrame, name: &str) -> Result<Series> {
         .cast(&DataType::Int32)
         .with_context(|| format!("cast column '{}' to int32", name))?;
     Ok(col.take_materialized_series())
+}
+
+/// Decode the QT main-data TSON payload into a `(.ci, .ri) → .y` map
+/// manually, reading the **correct** column-values key (`"values"`).
+///
+/// Why this exists: `tercen_rs::tson_to_dataframe` reads `col["data"]`,
+/// but Tercen's TSON main-data tables use `col["values"]` (confirmed
+/// by rustson's test fixtures + the Python SDK's `tson_to_polars`).
+/// Using the wrong key silently produces a short / null-padded `.y`
+/// column past ~14976 rows on production data, and every chip past
+/// that row index NaN-fills downstream.
+///
+/// Structure expected:
+///
+/// ```text
+/// MAP {
+///   "cols": LST [
+///     MAP { "name": "ci", "values": LSTI32 [...] },
+///     MAP { "name": "ri", "values": LSTI32 [...] },
+///     MAP { "name": "y",  "values": LSTF64 [...] },
+///   ]
+/// }
+/// ```
+///
+/// Walks the column list, finds `.ci`/`.ri`/`.y` by their `name`
+/// field, validates that all three have the same length, then walks
+/// row-by-row to build the lookup map. Logs the per-column lengths
+/// + null counts for visibility.
+fn decode_main_data_yy(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
+    use rustson::Value;
+    let root = rustson::decode_bytes(tson_bytes)
+        .map_err(|e| anyhow!("rustson decode_bytes: {:?}", e))?;
+    let map = match root {
+        Value::MAP(m) => m,
+        other => bail!("expected TSON MAP at root, got {:?}", std::mem::discriminant(&other)),
+    };
+    let cols = match map.get("cols") {
+        Some(Value::LST(l)) => l,
+        _ => bail!("missing or non-LST `cols` field in TSON"),
+    };
+
+    let mut ci: Option<Vec<i32>> = None;
+    let mut ri: Option<Vec<i32>> = None;
+    let mut y: Option<Vec<f64>> = None;
+    for col in cols {
+        let Value::MAP(col_map) = col else { continue };
+        let Some(Value::STR(name)) = col_map.get("name") else { continue };
+        let values = col_map.get("values");
+        match name.as_str() {
+            ".ci" => ci = extract_i32(values)?,
+            ".ri" => ri = extract_i32(values)?,
+            ".y" => y = extract_f64(values)?,
+            _ => {}
+        }
+    }
+    let ci = ci.ok_or_else(|| anyhow!("`.ci` column missing from TSON"))?;
+    let ri = ri.ok_or_else(|| anyhow!("`.ri` column missing from TSON"))?;
+    let y = y.ok_or_else(|| anyhow!("`.y` column missing from TSON"))?;
+    tracing::info!(
+        ci_len = ci.len(),
+        ri_len = ri.len(),
+        y_len = y.len(),
+        "QT main-data column lengths (manual TSON decode)"
+    );
+    if !(ci.len() == ri.len() && ri.len() == y.len()) {
+        bail!(
+            "main-data column lengths still mismatched after manual decode: \
+             ci={}, ri={}, y={}",
+            ci.len(), ri.len(), y.len()
+        );
+    }
+    let n = ci.len();
+    let mut yy: HashMap<(i32, i32), f64> = HashMap::with_capacity(n);
+    let mut n_y_nan = 0usize;
+    for i in 0..n {
+        if y[i].is_nan() {
+            n_y_nan += 1;
+        }
+        yy.insert((ci[i], ri[i]), y[i]);
+    }
+    tracing::info!(yy_size = yy.len(), n_y_nan, "QT main-data yy map built");
+    Ok(yy)
+}
+
+/// Pull an i32 array out of a TSON column-values field. Accepts a few
+/// integer-typed variants since the encoder may pick a smaller width
+/// for compact tables.
+fn extract_i32(values: Option<&rustson::Value>) -> Result<Option<Vec<i32>>> {
+    use rustson::Value;
+    match values {
+        None => Ok(None),
+        Some(Value::LSTI32(v)) => Ok(Some(v.clone())),
+        Some(Value::LSTI16(v)) => Ok(Some(v.iter().map(|&x| x as i32).collect())),
+        Some(Value::LSTU16(v)) => Ok(Some(v.iter().map(|&x| x as i32).collect())),
+        Some(Value::LSTI64(v)) => Ok(Some(v.iter().map(|&x| x as i32).collect())),
+        Some(Value::LSTU32(v)) => Ok(Some(v.iter().map(|&x| x as i32).collect())),
+        Some(Value::LSTF64(v)) => Ok(Some(v.iter().map(|&x| x as i32).collect())),
+        Some(other) => bail!(
+            "expected integer-list for column values, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
+/// Pull an f64 array out of a TSON column-values field.
+fn extract_f64(values: Option<&rustson::Value>) -> Result<Option<Vec<f64>>> {
+    use rustson::Value;
+    match values {
+        None => Ok(None),
+        Some(Value::LSTF64(v)) => Ok(Some(v.clone())),
+        Some(Value::LSTF32(v)) => Ok(Some(v.iter().map(|&x| x as f64).collect())),
+        Some(Value::LSTI32(v)) => Ok(Some(v.iter().map(|&x| x as f64).collect())),
+        Some(Value::LSTI64(v)) => Ok(Some(v.iter().map(|&x| x as f64).collect())),
+        Some(other) => bail!(
+            "expected float-list for column values, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
 }

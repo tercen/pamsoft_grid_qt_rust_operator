@@ -2309,6 +2309,7 @@ dependencies = [
  "anyhow",
  "pamsoft_grid",
  "polars",
+ "rustson",
  "serde_json",
  "tercen-rs",
  "tokio",
