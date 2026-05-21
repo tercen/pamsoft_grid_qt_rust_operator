@@ -339,13 +339,37 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     // by returning `None` rather than panicking; we already bailed if
     // the columns disagree on length so positional access is safe.
     let mut yy: HashMap<(i32, i32), f64> = HashMap::with_capacity(total_rows);
+    let mut n_ci_null = 0usize;
+    let mut n_ri_null = 0usize;
+    let mut n_y_null = 0usize;
+    let mut n_y_nan = 0usize;
+    let mut last_some_y_at: Option<usize> = None;
+    let mut first_none_y_at: Option<usize> = None;
     for i in 0..total_rows {
-        let (Some(ci), Some(ri), Some(y)) = (ci_chunked.get(i), ri_chunked.get(i), y_chunked.get(i))
-        else {
-            continue;
-        };
+        let ci_v = ci_chunked.get(i);
+        let ri_v = ri_chunked.get(i);
+        let y_v = y_chunked.get(i);
+        if ci_v.is_none() { n_ci_null += 1; }
+        if ri_v.is_none() { n_ri_null += 1; }
+        if y_v.is_none() {
+            n_y_null += 1;
+            if first_none_y_at.is_none() { first_none_y_at = Some(i); }
+        } else {
+            last_some_y_at = Some(i);
+            if y_v.unwrap().is_nan() { n_y_nan += 1; }
+        }
+        let (Some(ci), Some(ri), Some(y)) = (ci_v, ri_v, y_v) else { continue; };
         yy.insert((ci, ri), y);
     }
+    tracing::info!(
+        n_ci_null,
+        n_ri_null,
+        n_y_null,
+        n_y_nan,
+        first_none_y_at = ?first_none_y_at,
+        last_some_y_at = ?last_some_y_at,
+        "QT main column null/NaN counts"
+    );
     if yy.is_empty() {
         bail!("main data table yielded zero non-null (.ci, .ri, .y) tuples.");
     }
