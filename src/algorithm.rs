@@ -156,16 +156,87 @@ fn run_one_chip(
         spot_pitch,
         "running QT pipeline"
     );
+    // Diagnostic: log a sample of what we wrote to the grid CSV so we
+    // can see in the production stdout whether the values reaching the
+    // algorithm look sane. Hash the grid CSV bytes so we can verify the
+    // operator's CSV builder agrees with the local reproducer.
+    {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        if let Ok(mut f) = std::fs::File::open(&grid_csv_path) {
+            let _ = f.read_to_end(&mut buf);
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&buf, &mut hasher);
+        let csv_hash = std::hash::Hasher::finish(&hasher);
+        tracing::info!(
+            chip = chip_name,
+            n_spots = grid_rows.len(),
+            grid_csv_path = %grid_csv_path.display(),
+            grid_csv_bytes = buf.len(),
+            grid_csv_hash = format!("{:016x}", csv_hash),
+            "grid CSV written"
+        );
+        if let Some(first) = grid_rows.first() {
+            tracing::info!(
+                chip = chip_name,
+                spot_id = %first.spot_id,
+                spot_row = first.spot_row,
+                spot_col = first.spot_col,
+                grid_x = first.grid_x,
+                grid_y = first.grid_y,
+                diameter = first.diameter,
+                "first spot"
+            );
+        }
+        if let Some(last) = grid_rows.last() {
+            tracing::info!(
+                chip = chip_name,
+                spot_id = %last.spot_id,
+                spot_row = last.spot_row,
+                spot_col = last.spot_col,
+                grid_x = last.grid_x,
+                grid_y = last.grid_y,
+                diameter = last.diameter,
+                "last spot"
+            );
+        }
+    }
+
     let started = std::time::Instant::now();
     let results = process_single_group_qt(&group)
         .map_err(|e| anyhow!("chip '{}' QT pipeline: {}", chip_name, e))?;
     let elapsed = started.elapsed();
+
+    // Diagnostic: count NaN results and log a sample. The production
+    // QT output has ~82% NaN on Mean_Signal across most chips while
+    // the same input run locally produces 0% NaN; this telemetry lets
+    // us see, in production, whether (a) per-chip nan counts match the
+    // pattern we see in the saved table and (b) which spots are NaN.
+    let n_nan = results.iter().filter(|r| r.mean_signal.is_nan()).count();
     tracing::info!(
         chip = chip_name,
         n_results = results.len(),
+        n_nan,
         elapsed_ms = elapsed.as_millis(),
         "chip done"
     );
+    if n_nan > 0 {
+        for r in results.iter().filter(|r| r.mean_signal.is_nan()).take(3) {
+            tracing::warn!(
+                chip = chip_name,
+                spot_id = %r.spot_id,
+                row = r.row,
+                col = r.col,
+                grid_x = r.grid_x,
+                grid_y = r.grid_y,
+                diameter = r.diameter,
+                empty = r.is_empty,
+                bad = r.is_bad,
+                "NaN-filled spot (sig_pix was empty)"
+            );
+        }
+    }
 
     // --- 5. Reverse-lookup: (image_label, spot_row, spot_col) → .ci ---
     // Each QuantResult carries image_name + Row/Column (the grid spot
