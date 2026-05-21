@@ -313,16 +313,35 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     let ri_chunked = ri_s.i32().context(".ri is not int32")?;
     let y_chunked = y_s.f64().context(".y is not float64")?;
 
-    // Build a HashMap<(ci, ri) → .y>. Skip null cells (Tercen materializes
-    // sparse data with NaNs / nulls; missing-variable rows propagate as
-    // NaN through the algorithm, matching R behaviour).
-    let mut yy: HashMap<(i32, i32), f64> = HashMap::with_capacity(qt_df.height());
-    for ((ci_opt, ri_opt), y_opt) in ci_chunked
-        .into_iter()
-        .zip(ri_chunked.into_iter())
-        .zip(y_chunked.into_iter())
-    {
-        let (Some(ci), Some(ri), Some(y)) = (ci_opt, ri_opt, y_opt) else {
+    // Defensive: require all three columns to have the same length, OR
+    // bail loudly. Production hit a bug where chips 11+ ended up with
+    // grid_x=NaN even though the MCP export of the same main-data
+    // table showed finite values for those cells — the most likely
+    // explanation being that `tson_to_dataframe` decoded `.y` to a
+    // shorter array than `.ci`/`.ri`, and the previous zip-based
+    // iteration silently truncated.
+    let n_ci = ci_chunked.len();
+    let n_ri = ri_chunked.len();
+    let n_y = y_chunked.len();
+    if !(n_ci == n_ri && n_ri == n_y) {
+        bail!(
+            "main data table columns have mismatched lengths: \
+             .ci={n_ci}, .ri={n_ri}, .y={n_y}. This usually means the \
+             TSON encoding decoded `.y` differently than the index \
+             columns — try requesting the table via a different API."
+        );
+    }
+    let total_rows = n_ci;
+    tracing::info!(total_rows, "QT main-data row count (all columns match)");
+
+    // Build a HashMap<(ci, ri) → .y> via positional indexing. Polars'
+    // chunked `.get(i)` returns `Option<T>` and handles out-of-bounds
+    // by returning `None` rather than panicking; we already bailed if
+    // the columns disagree on length so positional access is safe.
+    let mut yy: HashMap<(i32, i32), f64> = HashMap::with_capacity(total_rows);
+    for i in 0..total_rows {
+        let (Some(ci), Some(ri), Some(y)) = (ci_chunked.get(i), ri_chunked.get(i), y_chunked.get(i))
+        else {
             continue;
         };
         yy.insert((ci, ri), y);
