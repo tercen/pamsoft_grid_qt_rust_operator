@@ -285,6 +285,21 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         .await
         .map_err(|e| anyhow!("stream main data table {qt_table_id}: {e}"))?;
     let qt_df = tson_to_dataframe(&qt_tson).context("parse TSON main-table payload")?;
+    tracing::info!(
+        qt_table_id = %qt_table_id,
+        df_height = qt_df.height(),
+        df_width = qt_df.width(),
+        df_columns = ?qt_df.get_column_names(),
+        "QT main data DataFrame parsed"
+    );
+    // Diagnostic: print per-column lengths. If `.y` ends up shorter than
+    // `.ci`/`.ri`, the zip iterator below will truncate and we'd silently
+    // miss rows for high .ci values.
+    for col_name in [".ci", ".ri", ".y"] {
+        if let Ok(c) = qt_df.column(col_name) {
+            tracing::info!(col = col_name, len = c.len(), null_count = c.null_count(), "QT main column");
+        }
+    }
     let ci_s = owned_i32(&qt_df, ".ci")?;
     let ri_s = owned_i32(&qt_df, ".ri")?;
     let y_col = qt_df
@@ -314,6 +329,34 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     }
     if yy.is_empty() {
         bail!("main data table yielded zero non-null (.ci, .ri, .y) tuples.");
+    }
+    // Diagnostic: yy map size + per-ri ci coverage + sample lookups.
+    tracing::info!(yy_size = yy.len(), "QT main data yy map built");
+    // Count distinct .ci per .ri so we can see if some variables only
+    // got partial coverage from the TSON stream.
+    let mut per_ri: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    let mut max_ci_per_ri: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    for (&(_ci, ri), _) in &yy {
+        *per_ri.entry(ri).or_insert(0) += 1;
+        let e = max_ci_per_ri.entry(ri).or_insert(0);
+        if _ci > *e { *e = _ci; }
+    }
+    let mut keys: Vec<i32> = per_ri.keys().copied().collect();
+    keys.sort();
+    for ri in keys {
+        tracing::info!(
+            ri,
+            n_ci = per_ri[&ri],
+            max_ci = max_ci_per_ri[&ri],
+            "yy per-ri coverage"
+        );
+    }
+    // Sample lookups for known-finite cells (per MCP export):
+    for (ci_target, ri_target) in [(0i32, 6i32), (152, 6), (1520, 6), (1672, 6), (2000, 6), (5000, 6)] {
+        match yy.get(&(ci_target, ri_target)) {
+            Some(v) => tracing::info!(ci = ci_target, ri = ri_target, value = v, "yy sample"),
+            None => tracing::warn!(ci = ci_target, ri = ri_target, "yy sample: MISSING"),
+        }
     }
 
     // --- Denormalize ---
