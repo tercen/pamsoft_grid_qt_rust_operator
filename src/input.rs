@@ -291,7 +291,23 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     // short / null-padded `.y` column past ~14976 rows on this dataset,
     // which is the bug that made every chip 11+ NaN-fill in the
     // operator's QT output.
-    let yy = decode_main_data_yy(&qt_tson).context("decode QT main-data TSON")?;
+    //
+    // If the manual decoder fails (e.g. the actual TSON has yet a
+    // third structure we haven't covered yet), fall back to the
+    // tercen-rs path so the operator still produces output. The
+    // diagnostic logs from `decode_main_data_yy` will tell us what
+    // shape the TSON actually has so we can fix it.
+    let yy = match decode_main_data_yy(&qt_tson) {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::error!(
+                "manual TSON decode failed: {e:#}. Falling back to tercen-rs \
+                 tson_to_dataframe path — chips 11+ will likely NaN-fill in \
+                 the QT output, but the operator will at least produce SOMETHING."
+            );
+            fallback_yy_via_dataframe(&qt_tson)?
+        }
+    };
     if yy.is_empty() {
         bail!("main data table yielded zero non-null (.ci, .ri, .y) tuples.");
     }
@@ -469,22 +485,70 @@ fn decode_main_data_yy(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
     use rustson::Value;
     let root = rustson::decode_bytes(tson_bytes)
         .map_err(|e| anyhow!("rustson decode_bytes: {:?}", e))?;
-    let map = match root {
-        Value::MAP(m) => m,
-        other => bail!("expected TSON MAP at root, got {:?}", std::mem::discriminant(&other)),
+    tracing::info!(
+        bytes = tson_bytes.len(),
+        root_kind = root_kind_name(&root),
+        "TSON root decoded"
+    );
+
+    // Find the column list. Tercen TSON appears in two shapes in the
+    // wild: `MAP { "cols": LST [...] }` (what tercen-rs's
+    // tson_to_dataframe expects) or `MAP { "columns": LST [...] }`
+    // (what Python's tson_to_polars expects). Also handle the case
+    // where the top level is the LST itself.
+    let cols_owned: Vec<Value> = match &root {
+        Value::MAP(m) => {
+            let keys: Vec<String> = m.keys().cloned().collect();
+            tracing::info!(top_keys = ?keys, "TSON root is MAP");
+            if let Some(Value::LST(l)) = m.get("cols") {
+                tracing::info!(n_cols = l.len(), "found `cols` key");
+                l.clone()
+            } else if let Some(Value::LST(l)) = m.get("columns") {
+                tracing::info!(n_cols = l.len(), "found `columns` key");
+                l.clone()
+            } else {
+                bail!(
+                    "no `cols` or `columns` LST in TSON root MAP (keys: {:?})",
+                    keys
+                );
+            }
+        }
+        Value::LST(l) => {
+            tracing::info!(n_cols = l.len(), "TSON root is bare LST");
+            l.clone()
+        }
+        other => bail!("expected TSON MAP or LST at root, got {}", root_kind_name(other)),
     };
-    let cols = match map.get("cols") {
-        Some(Value::LST(l)) => l,
-        _ => bail!("missing or non-LST `cols` field in TSON"),
-    };
+    tracing::info!(n_cols = cols_owned.len(), "TSON cols list");
 
     let mut ci: Option<Vec<i32>> = None;
     let mut ri: Option<Vec<i32>> = None;
     let mut y: Option<Vec<f64>> = None;
-    for col in cols {
-        let Value::MAP(col_map) = col else { continue };
-        let Some(Value::STR(name)) = col_map.get("name") else { continue };
-        let values = col_map.get("values");
+    for (idx, col) in cols_owned.iter().enumerate() {
+        let Value::MAP(col_map) = col else {
+            tracing::warn!(idx, kind = root_kind_name(col), "col is not a MAP — skipping");
+            continue;
+        };
+        let col_keys: Vec<String> = col_map.keys().cloned().collect();
+        let name = col_map
+            .get("name")
+            .or_else(|| col_map.get("Name"))
+            .and_then(|v| if let Value::STR(s) = v { Some(s.clone()) } else { None });
+        // Try the two known keys for the actual data: `values` (Python
+        // SDK convention, also what rustson tests use) and `data`
+        // (tercen-rs convention). Pick whichever is present.
+        let values = col_map
+            .get("values")
+            .or_else(|| col_map.get("data"));
+        let value_kind = values.map(root_kind_name).unwrap_or("None");
+        tracing::info!(
+            idx,
+            name = name.as_deref().unwrap_or("<unnamed>"),
+            keys = ?col_keys,
+            value_kind,
+            "col"
+        );
+        let Some(name) = name else { continue };
         match name.as_str() {
             ".ci" => ci = extract_i32(values)?,
             ".ri" => ri = extract_i32(values)?,
@@ -519,6 +583,70 @@ fn decode_main_data_yy(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
     }
     tracing::info!(yy_size = yy.len(), n_y_nan, "QT main-data yy map built");
     Ok(yy)
+}
+
+/// Fallback that uses tercen-rs's `tson_to_dataframe` path. Same code
+/// as before — kept for graceful degradation if the manual decoder
+/// can't find the column data. Produces a `(.ci, .ri) → .y` map with
+/// (most likely) the broken short-`.y` behaviour that motivated the
+/// manual decode in the first place; the operator's output will then
+/// be partially NaN-filled, but at least the rest of the pipeline
+/// runs and we get diagnostic information.
+fn fallback_yy_via_dataframe(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
+    let df = tson_to_dataframe(tson_bytes).context("fallback tson_to_dataframe")?;
+    tracing::warn!(
+        df_height = df.height(),
+        df_width = df.width(),
+        df_columns = ?df.get_column_names(),
+        "fallback DataFrame parsed (likely short)"
+    );
+    let ci_s = owned_i32(&df, ".ci")?;
+    let ri_s = owned_i32(&df, ".ri")?;
+    let y_col = df
+        .column(".y")
+        .map_err(|e| anyhow!("missing .y column on main table: {e}"))?
+        .cast(&DataType::Float64)
+        .context("cast .y to float64")?;
+    let y_s = y_col.take_materialized_series();
+    let ci_chunked = ci_s.i32().context(".ci is not int32")?;
+    let ri_chunked = ri_s.i32().context(".ri is not int32")?;
+    let y_chunked = y_s.f64().context(".y is not float64")?;
+    let n = ci_chunked.len().min(ri_chunked.len()).min(y_chunked.len());
+    let mut yy: HashMap<(i32, i32), f64> = HashMap::with_capacity(n);
+    for i in 0..n {
+        let (Some(ci), Some(ri), Some(y)) = (ci_chunked.get(i), ri_chunked.get(i), y_chunked.get(i))
+        else { continue };
+        yy.insert((ci, ri), y);
+    }
+    tracing::warn!(yy_size = yy.len(), "fallback yy map built");
+    Ok(yy)
+}
+
+/// Short debug name for a TSON Value variant — used when logging the
+/// structure we got vs what we expected. Avoids dumping multi-MB data
+/// from the actual variant.
+fn root_kind_name(v: &rustson::Value) -> &'static str {
+    use rustson::Value;
+    match v {
+        Value::NULL => "NULL",
+        Value::STR(_) => "STR",
+        Value::I32(_) => "I32",
+        Value::F64(_) => "F64",
+        Value::BOOL(_) => "BOOL",
+        Value::LST(_) => "LST",
+        Value::MAP(_) => "MAP",
+        Value::LSTU8(_) => "LSTU8",
+        Value::LSTI8(_) => "LSTI8",
+        Value::LSTU16(_) => "LSTU16",
+        Value::LSTI16(_) => "LSTI16",
+        Value::LSTU32(_) => "LSTU32",
+        Value::LSTI32(_) => "LSTI32",
+        Value::LSTU64(_) => "LSTU64",
+        Value::LSTI64(_) => "LSTI64",
+        Value::LSTF32(_) => "LSTF32",
+        Value::LSTF64(_) => "LSTF64",
+        Value::LSTSTR(_) => "LSTSTR",
+    }
 }
 
 /// Pull an i32 array out of a TSON column-values field. Accepts a few
