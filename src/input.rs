@@ -220,7 +220,7 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     let streamer = ctx.streamer();
     let mut col_cols: Vec<String> = resolved_cnames.clone();
     col_cols.extend(document_id_columns.iter().cloned());
-    let col_df = paged_stream_df(&streamer, &col_table_id, col_cols.clone())
+    let col_df = stream_full_table(&streamer, &col_table_id, col_cols.clone())
         .await
         .context("stream column-facet table")?;
 
@@ -243,7 +243,7 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         .collect::<Result<Vec<_>>>()?;
 
     // --- Stream row-facet: variable per .ri (positional) ---
-    let row_df = paged_stream_df(&streamer, &row_table_id, vec![variable_col.clone()])
+    let row_df = stream_full_table(&streamer, &row_table_id, vec![variable_col.clone()])
         .await
         .context("stream row-facet table")?;
     let n_var_rows = row_df.height();
@@ -278,7 +278,7 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     }
 
     // --- Stream main data table (paginated; Tercen caps -1 reads at 15k rows) ---
-    let qt_df = paged_stream_df(
+    let qt_df = stream_full_table(
         &streamer,
         &qt_table_id,
         vec![".ci".to_string(), ".ri".to_string(), ".y".to_string()],
@@ -439,47 +439,57 @@ fn strip_namespace(s: &str) -> &str {
     s.split_once('.').map(|(_, rest)| rest).unwrap_or(s)
 }
 
-/// Tercen caps single `streamTable` responses at 15 000 rows regardless
-/// of `limit = -1`, so unlimited reads silently truncate. R operators
-/// work because the R SDK pages internally; Rust's tercen-rs leaves
-/// pagination to the caller. We loop with explicit `offset` / `limit`
-/// and vstack the resulting DataFrames until a short page signals EOF.
-async fn paged_stream_df(
+/// Stream an entire Tercen table into a `DataFrame` in one shot.
+///
+/// `streamTable` with `limit = -1` silently truncates at ~15 000 rows;
+/// what tercen-rs does internally (see `src/facets.rs`) is fetch the
+/// schema first, read `n_rows` off it, then ask for exactly that
+/// many. Server-side, Tercen respects positive `limit` values and
+/// streams the bytes back across multiple gRPC chunks that
+/// concatenate into a single TSON document.
+///
+/// The earlier 0.2.8 paginated implementation hung — most likely
+/// because Tercen returns exactly `limit` rows on every call for
+/// positive limits without honoring `offset`, so the loop never made
+/// progress. Schema-first single-shot avoids the offset semantics
+/// entirely. 5-minute timeout guards against a truly hung gRPC
+/// stream.
+async fn stream_full_table(
     streamer: &tercen_rs::table::TableStreamer<'_>,
     table_id: &str,
     cols: Vec<String>,
 ) -> Result<DataFrame> {
-    const PAGE: i64 = 10_000;
-    let mut offset: i64 = 0;
-    let mut acc: Option<DataFrame> = None;
-    loop {
-        let bytes = streamer
-            .stream_tson(table_id, Some(cols.clone()), offset, PAGE)
-            .await
-            .map_err(|e| anyhow!("stream {table_id} @ offset {offset}: {e}"))?;
-        if bytes.is_empty() {
-            break;
-        }
-        let df = tson_to_dataframe(&bytes)
-            .with_context(|| format!("decode page @ offset {offset} of {table_id}"))?;
-        let h = df.height();
-        if h == 0 {
-            break;
-        }
-        acc = Some(match acc {
-            None => df,
-            Some(mut prev) => {
-                prev.vstack_mut(&df)
-                    .map_err(|e| anyhow!("vstack page @ offset {offset}: {e}"))?;
-                prev
-            }
-        });
-        offset += h as i64;
-        if (h as i64) < PAGE {
-            break;
-        }
+    use tercen_rs::client::proto::e_schema;
+    let schema = streamer
+        .get_schema(table_id)
+        .await
+        .map_err(|e| anyhow!("get_schema {table_id}: {e}"))?;
+    let n_rows: i64 = match &schema.object {
+        Some(e_schema::Object::Cubequerytableschema(s)) => s.n_rows.into(),
+        Some(e_schema::Object::Tableschema(s)) => s.n_rows.into(),
+        Some(e_schema::Object::Computedtableschema(s)) => s.n_rows.into(),
+        other => bail!("unexpected schema variant for {table_id}: {:?}", other),
+    };
+    tracing::info!(table_id, n_rows, n_cols = cols.len(), "stream_full_table");
+    if n_rows == 0 {
+        return Ok(DataFrame::default());
     }
-    Ok(acc.unwrap_or_default())
+    let t0 = std::time::Instant::now();
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        streamer.stream_tson(table_id, Some(cols), 0, n_rows),
+    )
+    .await
+    .map_err(|_| anyhow!("stream {table_id}: timed out after 300s (n_rows={n_rows})"))?
+    .map_err(|e| anyhow!("stream {table_id}: {e}"))?;
+    let df = tson_to_dataframe(&bytes)
+        .with_context(|| format!("decode {} bytes from {table_id}", bytes.len()))?;
+    tracing::info!(
+        table_id, n_rows, bytes = bytes.len(), df_h = df.height(),
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "stream_full_table done"
+    );
+    Ok(df)
 }
 
 /// Pull a string column out of a `DataFrame` as an owned `Series`,
