@@ -97,6 +97,13 @@ pub struct InputData {
     /// Names of the documentId columns in the column-facet schema, in
     /// schema order. `len()` is always 1 or 2.
     pub document_id_columns: Vec<String>,
+    /// Diagnostic string describing the QT main-data TSON shape — what
+    /// the manual decoder saw at the top level (MAP vs LST), the
+    /// top-level keys, per-column key sets and value variants, and
+    /// column lengths. Captured into the output table so we can debug
+    /// the chip-11+ NaN-fill bug from the operator's result, since
+    /// Tercen GCs the stderr.log within minutes of task completion.
+    pub tson_diagnostic: String,
 }
 
 impl InputData {
@@ -297,15 +304,23 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     // tercen-rs path so the operator still produces output. The
     // diagnostic logs from `decode_main_data_yy` will tell us what
     // shape the TSON actually has so we can fix it.
-    let yy = match decode_main_data_yy(&qt_tson) {
-        Ok(map) => map,
+    let mut tson_diagnostic = String::with_capacity(2048);
+    use std::fmt::Write as _;
+    let yy = match decode_main_data_yy(&qt_tson, &mut tson_diagnostic) {
+        Ok(map) => {
+            let _ = writeln!(tson_diagnostic, "OK manual yy_size={}", map.len());
+            map
+        }
         Err(e) => {
+            let _ = writeln!(tson_diagnostic, "MANUAL_ERR {e:#}");
             tracing::error!(
                 "manual TSON decode failed: {e:#}. Falling back to tercen-rs \
                  tson_to_dataframe path — chips 11+ will likely NaN-fill in \
                  the QT output, but the operator will at least produce SOMETHING."
             );
-            fallback_yy_via_dataframe(&qt_tson)?
+            let map = fallback_yy_via_dataframe(&qt_tson, &mut tson_diagnostic)?;
+            let _ = writeln!(tson_diagnostic, "FALLBACK yy_size={}", map.len());
+            map
         }
     };
     if yy.is_empty() {
@@ -422,6 +437,7 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     Ok(InputData {
         rows,
         document_id_columns,
+        tson_diagnostic,
     })
 }
 
@@ -481,10 +497,20 @@ fn owned_i32(df: &DataFrame, name: &str) -> Result<Series> {
 /// field, validates that all three have the same length, then walks
 /// row-by-row to build the lookup map. Logs the per-column lengths
 /// + null counts for visibility.
-fn decode_main_data_yy(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
+fn decode_main_data_yy(
+    tson_bytes: &[u8],
+    diag: &mut String,
+) -> Result<HashMap<(i32, i32), f64>> {
     use rustson::Value;
+    use std::fmt::Write;
     let root = rustson::decode_bytes(tson_bytes)
         .map_err(|e| anyhow!("rustson decode_bytes: {:?}", e))?;
+    let _ = writeln!(
+        diag,
+        "bytes={} root_kind={}",
+        tson_bytes.len(),
+        root_kind_name(&root)
+    );
     tracing::info!(
         bytes = tson_bytes.len(),
         root_kind = root_kind_name(&root),
@@ -499,11 +525,14 @@ fn decode_main_data_yy(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
     let cols_owned: Vec<Value> = match &root {
         Value::MAP(m) => {
             let keys: Vec<String> = m.keys().cloned().collect();
+            let _ = writeln!(diag, "root_map_keys={:?}", keys);
             tracing::info!(top_keys = ?keys, "TSON root is MAP");
             if let Some(Value::LST(l)) = m.get("cols") {
+                let _ = writeln!(diag, "cols_lst_len={}", l.len());
                 tracing::info!(n_cols = l.len(), "found `cols` key");
                 l.clone()
             } else if let Some(Value::LST(l)) = m.get("columns") {
+                let _ = writeln!(diag, "columns_lst_len={}", l.len());
                 tracing::info!(n_cols = l.len(), "found `columns` key");
                 l.clone()
             } else {
@@ -514,6 +543,7 @@ fn decode_main_data_yy(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
             }
         }
         Value::LST(l) => {
+            let _ = writeln!(diag, "root_lst_len={}", l.len());
             tracing::info!(n_cols = l.len(), "TSON root is bare LST");
             l.clone()
         }
@@ -537,15 +567,33 @@ fn decode_main_data_yy(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
         // Try the two known keys for the actual data: `values` (Python
         // SDK convention, also what rustson tests use) and `data`
         // (tercen-rs convention). Pick whichever is present.
-        let values = col_map
-            .get("values")
-            .or_else(|| col_map.get("data"));
+        let values_val = col_map.get("values");
+        let data_val = col_map.get("data");
+        let values = values_val.or(data_val);
         let value_kind = values.map(root_kind_name).unwrap_or("None");
+        let values_len = values.and_then(typed_data_len).unwrap_or(0);
+        // Critical for the bug: if both `values` and `data` exist with
+        // DIFFERENT lengths, that's the smoking gun for the tercen-rs
+        // tson_to_dataframe truncation. Capture both side by side.
+        let values_key_len = values_val.and_then(typed_data_len).unwrap_or(0);
+        let data_key_len = data_val.and_then(typed_data_len).unwrap_or(0);
+        let _ = writeln!(
+            diag,
+            "col[{}] name={:?} keys={:?} value_kind={} chosen_len={} values_key_len={} data_key_len={}",
+            idx,
+            name.as_deref().unwrap_or("<unnamed>"),
+            col_keys,
+            value_kind,
+            values_len,
+            values_key_len,
+            data_key_len,
+        );
         tracing::info!(
             idx,
             name = name.as_deref().unwrap_or("<unnamed>"),
             keys = ?col_keys,
             value_kind,
+            values_len,
             "col"
         );
         let Some(name) = name else { continue };
@@ -559,6 +607,13 @@ fn decode_main_data_yy(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
     let ci = ci.ok_or_else(|| anyhow!("`.ci` column missing from TSON"))?;
     let ri = ri.ok_or_else(|| anyhow!("`.ri` column missing from TSON"))?;
     let y = y.ok_or_else(|| anyhow!("`.y` column missing from TSON"))?;
+    let _ = writeln!(
+        diag,
+        "decoded ci_len={} ri_len={} y_len={}",
+        ci.len(),
+        ri.len(),
+        y.len()
+    );
     tracing::info!(
         ci_len = ci.len(),
         ri_len = ri.len(),
@@ -592,8 +647,19 @@ fn decode_main_data_yy(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
 /// manual decode in the first place; the operator's output will then
 /// be partially NaN-filled, but at least the rest of the pipeline
 /// runs and we get diagnostic information.
-fn fallback_yy_via_dataframe(tson_bytes: &[u8]) -> Result<HashMap<(i32, i32), f64>> {
+fn fallback_yy_via_dataframe(
+    tson_bytes: &[u8],
+    diag: &mut String,
+) -> Result<HashMap<(i32, i32), f64>> {
+    use std::fmt::Write;
     let df = tson_to_dataframe(tson_bytes).context("fallback tson_to_dataframe")?;
+    let _ = writeln!(
+        diag,
+        "FALLBACK df_height={} df_width={} cols={:?}",
+        df.height(),
+        df.width(),
+        df.get_column_names()
+    );
     tracing::warn!(
         df_height = df.height(),
         df_width = df.width(),
@@ -647,6 +713,29 @@ fn root_kind_name(v: &rustson::Value) -> &'static str {
         Value::LSTF64(_) => "LSTF64",
         Value::LSTSTR(_) => "LSTSTR",
     }
+}
+
+/// Length of a typed-array TSON value, or 0 for non-array kinds. Used
+/// for diagnostics — we want to see whether `values` and `data` have
+/// the same length on each column.
+fn typed_data_len(v: &rustson::Value) -> Option<usize> {
+    use rustson::Value;
+    Some(match v {
+        Value::LST(l) => l.len(),
+        Value::LSTU8(l) => l.len(),
+        Value::LSTI8(l) => l.len(),
+        Value::LSTU16(l) => l.len(),
+        Value::LSTI16(l) => l.len(),
+        Value::LSTU32(l) => l.len(),
+        Value::LSTI32(l) => l.len(),
+        Value::LSTU64(l) => l.len(),
+        Value::LSTI64(l) => l.len(),
+        Value::LSTF32(l) => l.len(),
+        Value::LSTF64(l) => l.len(),
+        // StrVec stores bytes — closest analogue to "length" is byte count.
+        Value::LSTSTR(l) => l.bytes.len(),
+        _ => return None,
+    })
 }
 
 /// Pull an i32 array out of a TSON column-values field. Accepts a few

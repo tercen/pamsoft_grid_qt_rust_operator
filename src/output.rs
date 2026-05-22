@@ -66,10 +66,17 @@ const DIAGNOSTIC_COLUMNS: &[&str] = &[
 /// onto its name. `is_diagnostic` controls whether the
 /// diagnostic-only columns are kept (matches the R operator's
 /// `Diagnostic Output` Yes/No property).
+///
+/// `tson_diag` is a multi-line description of the QT main-data TSON
+/// shape (top-level keys, per-column keys/lengths). It's written into
+/// the *first* row of an extra `Tson_Diagnostic` column so we can
+/// inspect it from the operator's prod output (the only telemetry
+/// channel that survives Tercen's stderr GC).
 pub fn build_result_df(
     chips: &[ChipResult],
     namespace: &str,
     is_diagnostic: bool,
+    tson_diag: &str,
 ) -> Result<DataFrame> {
     let total: usize = chips.iter().map(|c| c.results.len()).sum();
 
@@ -126,6 +133,14 @@ pub fn build_result_df(
 
     let ns_col = |suffix: &str| format!("{}.{}", namespace, suffix);
 
+    // Diagnostic string lives in row 0 only — empty for every other row.
+    // Polars columns are equal-length so we have to fill, but repeating
+    // the same blob `total` times would bloat the table by ~2 KB/row.
+    let mut tson_diag_col: Vec<Option<&str>> = vec![None; total];
+    if total > 0 {
+        tson_diag_col[0] = Some(tson_diag);
+    }
+
     let mut df = df! {
         ".ci" => ci_vec,
         &ns_col("Mean_Signal") => mean_signal,
@@ -143,6 +158,7 @@ pub fn build_result_df(
         &ns_col("Signal_Saturation") => signal_saturation,
         &ns_col("gridX") => grid_x,
         &ns_col("gridY") => grid_y,
+        &ns_col("Tson_Diagnostic") => tson_diag_col,
     }
     .map_err(|e| anyhow!("build result DataFrame: {e}"))?;
 

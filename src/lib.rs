@@ -143,8 +143,13 @@ async fn execute(ctx: &ContextBase, task_id: Option<&str>) -> Result<()> {
     );
 
     // Stage 6: build the Polars result DataFrame.
-    let df = output::build_result_df(&chip_results, ctx.namespace(), pamsoft_props.is_diagnostic)
-        .map_err(|e| anyhow::anyhow!("build result DataFrame: {e:#}"))?;
+    let df = output::build_result_df(
+        &chip_results,
+        ctx.namespace(),
+        pamsoft_props.is_diagnostic,
+        &input_data.tson_diagnostic,
+    )
+    .map_err(|e| anyhow::anyhow!("build result DataFrame: {e:#}"))?;
     tracing::info!(
         n_rows = df.height(),
         n_cols = df.width(),
