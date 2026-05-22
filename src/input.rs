@@ -33,6 +33,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use polars::prelude::*;
 use std::collections::{BTreeSet, HashMap};
 use tercen_rs::context::ContextBase;
+use tercen_rs::tson_to_dataframe;
 
 /// The 9 variables we need from the gathered grid output. Matches
 /// `req.variables` at R main.R:355.
@@ -461,201 +462,116 @@ fn strip_namespace(s: &str) -> &str {
     s.split_once('.').map(|(_, rest)| rest).unwrap_or(s)
 }
 
-/// Stream an entire Tercen table into a `DataFrame` via HTTP REST
-/// `POST /api/v1/schema/selectStream`.
+/// Stream an entire Tercen table into a `DataFrame` via gRPC
+/// `streamTable`, paginated with explicit offset / limit chunks.
 ///
-/// Why HTTP not gRPC: tercen-rs's `stream_tson` uses gRPC
-/// `streamTable`, which on Tercen's server returns a verbose TSON
-/// encoding (5.5× larger per row than HTTP) and silently caps
-/// responses at ~15 000 rows on production tables. The R SDK works
-/// correctly on the same data because it uses this HTTP endpoint —
-/// confirmed by reproducing both calls externally: gRPC returned
-/// 15 000 rows for the same table where HTTP returns 82 080.
+/// The ggrs_plot_operator team already solved this in
+/// `src/ggrs_integration/stream_generator.rs:799-835` and documented
+/// the underlying constraint on line 799:
 ///
-/// The two endpoints also speak different TSON dialects:
-///   - gRPC  : `MAP{cols:[MAP{name, type, data}]}`
-///   - HTTP  : `MAP{kind, nRows, properties, columns:[MAP{name, type, values}]}`
-/// so we hand-decode the response reading `columns[].values` instead
-/// of leaning on `tercen_rs::tson_to_dataframe` (which targets the
-/// gRPC dialect).
+///   > Stream data in chunks and accumulate
+///   > (TSON decoding only handles one chunk at a time)
+///
+/// The constraint: `tercen-rs::stream_tson` concatenates the bytes
+/// from every gRPC server-stream response and then calls
+/// `tson_to_dataframe` on the concat — but a TSON decoder reads
+/// only the first complete document and stops. So any call where
+/// the server responds with more than one chunk silently drops
+/// every chunk past the first (~15 000 rows on the production
+/// pamsoft data). `limit = -1` always triggers this; an explicit
+/// positive `limit` <= the server's per-call cap does not.
+///
+/// The fix is the ggrs pattern: read the schema's `n_rows`, then
+/// loop with `chunk_size = 50 000` (intentionally above the server
+/// cap so we get its real per-call ceiling and advance correctly),
+/// concat the per-chunk DataFrames. Advance `offset` by the
+/// **actual** rows returned, not by the requested limit, so if the
+/// server gives us back fewer than asked we still make progress.
 async fn stream_full_table(
-    _ctx: &ContextBase,
+    ctx: &ContextBase,
     table_id: &str,
     cols: Vec<String>,
     diag: &mut String,
 ) -> Result<DataFrame> {
-    use rustson::Value;
-    use std::collections::HashMap as StdHashMap;
     use std::fmt::Write as _;
+    use tercen_rs::client::proto::e_schema;
 
-    let base_uri = std::env::var("TERCEN_URI").map_err(|_| {
-        anyhow!("TERCEN_URI not set — main.rs should populate it from --serviceUri")
-    })?;
-    let token = std::env::var("TERCEN_TOKEN").map_err(|_| {
-        anyhow!("TERCEN_TOKEN not set — main.rs should populate it from --token")
-    })?;
-
-    let cnames_lst: Vec<Value> = cols.iter().cloned().map(Value::STR).collect();
-    let mut body_map: StdHashMap<String, Value> = StdHashMap::new();
-    body_map.insert("tableId".into(), Value::STR(table_id.into()));
-    body_map.insert("cnames".into(), Value::LST(cnames_lst));
-    body_map.insert("offset".into(), Value::I32(0));
-    body_map.insert("limit".into(), Value::I32(-1));
-    let req_bytes = rustson::encode(&Value::MAP(body_map))
-        .map_err(|e| anyhow!("encode selectStream body: {:?}", e))?;
-
-    // In production Tercen the `--serviceUri` arg points at the gRPC
-    // backend's port (50051 in the deployment edgar runs against),
-    // which is HTTP/2 only — reqwest's default HTTP/1.1 fails with
-    // "error sending request". gRPC servers built on dart-grpc /
-    // gprc-java typically also accept generic HTTP/2 requests and
-    // route by content-type. Enabling `.http2_prior_knowledge()` makes
-    // reqwest send h2c frames directly on plain HTTP URLs, which is
-    // what we need against an h2-only backend.
-    let url = format!(
-        "{}/api/v1/schema/selectStream",
-        base_uri.trim_end_matches('/')
-    );
-    let _ = writeln!(diag, "selectStream POST {url} (h2c on http://)");
-    let t0 = std::time::Instant::now();
-    let client = reqwest::Client::builder()
-        .http2_prior_knowledge()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| anyhow!("build http client: {e}"))?;
-    let resp = client
-        .post(&url)
-        .header("authorization", &token)
-        .header("content-type", "application/tson")
-        .header("accept", "application/tson")
-        .body(req_bytes)
-        .send()
+    let streamer = ctx.streamer();
+    let schema = streamer
+        .get_schema(table_id)
         .await
-        .map_err(|e| {
-            use std::error::Error as _;
-            // Reqwest's `error sending request` swallows the underlying
-            // hyper error. Walk the source chain so the diagnostic
-            // column tells us whether it was a TCP refuse, an HTTP/2
-            // handshake failure, or something else.
-            let mut chain: Vec<String> = vec![format!("{e}")];
-            let mut src: Option<&dyn std::error::Error> = e.source();
-            while let Some(s) = src {
-                chain.push(format!("{s}"));
-                src = s.source();
-            }
-            anyhow!(
-                "POST selectStream {table_id} url={url}: {}",
-                chain.join(" | ")
-            )
-        })?;
-    let status = resp.status();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| anyhow!("read selectStream {table_id} body: {e}"))?;
-    if !status.is_success() {
-        let snippet = String::from_utf8_lossy(&body[..body.len().min(200)]);
-        bail!("selectStream {table_id} url={url} HTTP {status}: {snippet:?}");
+        .map_err(|e| anyhow!("get_schema {table_id}: {e}"))?;
+    let n_rows: i64 = match &schema.object {
+        Some(e_schema::Object::Cubequerytableschema(s)) => s.n_rows.into(),
+        Some(e_schema::Object::Tableschema(s)) => s.n_rows.into(),
+        Some(e_schema::Object::Computedtableschema(s)) => s.n_rows.into(),
+        other => bail!("unexpected schema variant for {table_id}: {:?}", other),
+    };
+    let _ = writeln!(diag, "table={} schema_n_rows={}", table_id, n_rows);
+    if n_rows == 0 {
+        return Ok(DataFrame::default());
     }
-    let df = decode_select_stream(&body, cols.as_slice())
-        .with_context(|| format!("decode selectStream {table_id} ({} bytes)", body.len()))?;
+
+    const CHUNK_SIZE: i64 = 50_000;
+    let mut accumulated: Vec<DataFrame> = Vec::new();
+    let mut offset: i64 = 0;
+    let t0 = std::time::Instant::now();
+    while offset < n_rows {
+        let limit = (n_rows - offset).min(CHUNK_SIZE);
+        let bytes = streamer
+            .stream_tson(table_id, Some(cols.clone()), offset, limit)
+            .await
+            .map_err(|e| anyhow!("stream_tson {table_id} @ offset {offset}: {e}"))?;
+        if bytes.is_empty() {
+            break;
+        }
+        let df = tson_to_dataframe(&bytes)
+            .with_context(|| format!("decode chunk @ offset {offset} of {table_id}"))?;
+        let h = df.height();
+        if h == 0 {
+            break;
+        }
+        let _ = writeln!(
+            diag,
+            "chunk offset={offset} requested_limit={limit} returned_h={h} bytes={}",
+            bytes.len()
+        );
+        accumulated.push(df);
+        offset += h as i64;
+    }
+
+    let final_df = if accumulated.is_empty() {
+        DataFrame::default()
+    } else if accumulated.len() == 1 {
+        accumulated.into_iter().next().unwrap()
+    } else {
+        concat(
+            accumulated
+                .iter()
+                .map(|df| df.clone().lazy())
+                .collect::<Vec<_>>(),
+            UnionArgs::default(),
+        )
+        .map_err(|e| anyhow!("concat chunks of {table_id}: {e}"))?
+        .collect()
+        .map_err(|e| anyhow!("collect concatenated chunks of {table_id}: {e}"))?
+    };
+
     let _ = writeln!(
         diag,
-        "selectStream {table_id} resp_bytes={} df_h={} df_w={} elapsed_ms={}",
-        body.len(),
-        df.height(),
-        df.width(),
+        "stream_full_table {table_id} done: df_h={} elapsed_ms={}",
+        final_df.height(),
         t0.elapsed().as_millis()
     );
     tracing::info!(
         table_id,
-        resp_bytes = body.len(),
-        df_h = df.height(),
-        df_w = df.width(),
+        n_rows,
+        df_h = final_df.height(),
         elapsed_ms = t0.elapsed().as_millis() as u64,
-        "selectStream done"
+        "stream_full_table done"
     );
-    Ok(df)
+    Ok(final_df)
 }
-
-/// Decode an HTTP `selectStream` response: a TSON MAP carrying
-/// `columns:[MAP{name, type, values}]`. Each column's `values` is a
-/// typed array (LSTI32 / LSTF64 / LSTSTR / …). We build a Polars
-/// Series per column and zip into a DataFrame preserving the order
-/// requested in `wanted_cols` (the API may return columns in
-/// arbitrary order — explicitly we want positional consistency for
-/// the row-facet / column-facet table downstream).
-fn decode_select_stream(body: &[u8], wanted_cols: &[String]) -> Result<DataFrame> {
-    use rustson::Value;
-    let root = rustson::decode_bytes(body).map_err(|e| anyhow!("rustson decode: {:?}", e))?;
-    let Value::MAP(root_map) = root else {
-        bail!("selectStream root is not a MAP");
-    };
-    let Some(Value::LST(cols)) = root_map.get("columns") else {
-        bail!(
-            "selectStream missing `columns` LST (keys: {:?})",
-            root_map.keys().collect::<Vec<_>>()
-        );
-    };
-    let mut by_name: std::collections::HashMap<String, Series> = std::collections::HashMap::new();
-    for col in cols.iter() {
-        let Value::MAP(cm) = col else { continue };
-        let Some(Value::STR(name)) = cm.get("name") else { continue };
-        let Some(values) = cm.get("values") else {
-            bail!(
-                "column {name} has no `values` key (keys: {:?})",
-                cm.keys().collect::<Vec<_>>()
-            );
-        };
-        let series = match values {
-            Value::LSTI32(v) => Series::new(name.as_str().into(), v.as_slice()),
-            Value::LSTI64(v) => Series::new(name.as_str().into(), v.as_slice()),
-            Value::LSTU32(v) => Series::new(
-                name.as_str().into(),
-                v.iter().map(|&x| x as i64).collect::<Vec<i64>>(),
-            ),
-            Value::LSTU16(v) => Series::new(
-                name.as_str().into(),
-                v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
-            ),
-            Value::LSTI16(v) => Series::new(
-                name.as_str().into(),
-                v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
-            ),
-            Value::LSTF32(v) => Series::new(
-                name.as_str().into(),
-                v.iter().map(|&x| x as f64).collect::<Vec<f64>>(),
-            ),
-            Value::LSTF64(v) => Series::new(name.as_str().into(), v.as_slice()),
-            Value::LSTSTR(strs) => {
-                let owned: Vec<String> = strs
-                    .try_to_vec()
-                    .map_err(|e| anyhow!("StrVec.try_to_vec for {name}: {:?}", e))?;
-                Series::new(name.as_str().into(), owned)
-            }
-            other => bail!(
-                "column {name} `values` has unsupported variant {:?}",
-                std::mem::discriminant(other)
-            ),
-        };
-        by_name.insert(name.clone(), series);
-    }
-    let mut ordered: Vec<Series> = Vec::with_capacity(wanted_cols.len());
-    for want in wanted_cols {
-        let Some(s) = by_name.remove(want) else {
-            bail!("selectStream did not return requested column {want}");
-        };
-        ordered.push(s);
-    }
-    let df = DataFrame::new(ordered.into_iter().map(Column::from).collect())
-        .map_err(|e| anyhow!("build DataFrame from columns: {e}"))?;
-    Ok(df)
-}
-
-/// Pull a string column out of a `DataFrame` as an owned `Series`,
-/// casting if necessary. The owned `Series` is needed because polars'
-/// `&StringChunked` accessors borrow from a `Series` that has to
-/// outlive them.
 fn owned_str(df: &DataFrame, name: &str) -> Result<Series> {
     let col = df
         .column(name)
