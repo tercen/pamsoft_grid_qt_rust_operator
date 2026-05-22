@@ -216,7 +216,30 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         })?;
 
     // --- Stream column-facet ---
-    let mut tson_diagnostic = String::with_capacity(1024);
+    let mut tson_diagnostic = String::with_capacity(2048);
+    {
+        use std::fmt::Write as _;
+        // Surface every Tercen-related env var so that, if the HTTP
+        // POST below can't reach the REST endpoint, we can see what
+        // URL/host Tercen actually gave us in the operator's prod
+        // output (the diagnostic column survives stderr GC).
+        for key in [
+            "TERCEN_URI", "TERCEN_SERVICE_URI", "TERCEN_TASK_ID",
+            "TERCEN_WEB_APP_PORT", "TERCEN_REST_URI", "TERCEN_PUBLIC_URI",
+        ] {
+            match std::env::var(key) {
+                Ok(v) if key == "TERCEN_TOKEN" => {
+                    let _ = writeln!(tson_diagnostic, "env {key}=<{} bytes redacted>", v.len());
+                }
+                Ok(v) => {
+                    let _ = writeln!(tson_diagnostic, "env {key}={v}");
+                }
+                Err(_) => {
+                    let _ = writeln!(tson_diagnostic, "env {key}=<unset>");
+                }
+            }
+        }
+    }
     let mut col_cols: Vec<String> = resolved_cnames.clone();
     col_cols.extend(document_id_columns.iter().cloned());
     let col_df = stream_full_table(ctx, &col_table_id, col_cols.clone(), &mut tson_diagnostic)
@@ -481,12 +504,22 @@ async fn stream_full_table(
     let req_bytes = rustson::encode(&Value::MAP(body_map))
         .map_err(|e| anyhow!("encode selectStream body: {:?}", e))?;
 
+    // In production Tercen the `--serviceUri` arg points at the gRPC
+    // backend's port (50051 in the deployment edgar runs against),
+    // which is HTTP/2 only — reqwest's default HTTP/1.1 fails with
+    // "error sending request". gRPC servers built on dart-grpc /
+    // gprc-java typically also accept generic HTTP/2 requests and
+    // route by content-type. Enabling `.http2_prior_knowledge()` makes
+    // reqwest send h2c frames directly on plain HTTP URLs, which is
+    // what we need against an h2-only backend.
     let url = format!(
         "{}/api/v1/schema/selectStream",
         base_uri.trim_end_matches('/')
     );
+    let _ = writeln!(diag, "selectStream POST {url} (h2c on http://)");
     let t0 = std::time::Instant::now();
     let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| anyhow!("build http client: {e}"))?;
@@ -498,7 +531,23 @@ async fn stream_full_table(
         .body(req_bytes)
         .send()
         .await
-        .map_err(|e| anyhow!("POST selectStream {table_id}: {e}"))?;
+        .map_err(|e| {
+            use std::error::Error as _;
+            // Reqwest's `error sending request` swallows the underlying
+            // hyper error. Walk the source chain so the diagnostic
+            // column tells us whether it was a TCP refuse, an HTTP/2
+            // handshake failure, or something else.
+            let mut chain: Vec<String> = vec![format!("{e}")];
+            let mut src: Option<&dyn std::error::Error> = e.source();
+            while let Some(s) = src {
+                chain.push(format!("{s}"));
+                src = s.source();
+            }
+            anyhow!(
+                "POST selectStream {table_id} url={url}: {}",
+                chain.join(" | ")
+            )
+        })?;
     let status = resp.status();
     let body = resp
         .bytes()
@@ -506,7 +555,7 @@ async fn stream_full_table(
         .map_err(|e| anyhow!("read selectStream {table_id} body: {e}"))?;
     if !status.is_success() {
         let snippet = String::from_utf8_lossy(&body[..body.len().min(200)]);
-        bail!("selectStream {table_id} HTTP {status}: {snippet:?}");
+        bail!("selectStream {table_id} url={url} HTTP {status}: {snippet:?}");
     }
     let df = decode_select_stream(&body, cols.as_slice())
         .with_context(|| format!("decode selectStream {table_id} ({} bytes)", body.len()))?;
