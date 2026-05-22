@@ -51,6 +51,16 @@ zip = "0.6"
 # gRPC types for FileService request/response (server streaming download).
 tonic = "0.14"
 
+# Tercen's gRPC `streamTable` truncates large tables at ~15 000 rows
+# with a verbose TSON encoding that's specific to that endpoint. The
+# HTTP REST `/api/v1/schema/selectStream` endpoint that the R SDK uses
+# returns all rows in a different, more compact TSON encoding
+# (`columns[].values` instead of `cols[].data`). Reach has reqwest
+# for HTTP + rustson to encode the request body and decode the
+# response.
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+rustson = { git = "https://github.com/tercen/rustson", branch = "master" }
+
 [profile.release]
 opt-level = 3
 lto = "fat"
