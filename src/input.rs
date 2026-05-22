@@ -220,11 +220,9 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     let streamer = ctx.streamer();
     let mut col_cols: Vec<String> = resolved_cnames.clone();
     col_cols.extend(document_id_columns.iter().cloned());
-    let col_tson = streamer
-        .stream_tson(&col_table_id, Some(col_cols.clone()), 0, -1)
+    let col_df = paged_stream_df(&streamer, &col_table_id, col_cols.clone())
         .await
-        .map_err(|e| anyhow!("stream column-facet table {col_table_id}: {e}"))?;
-    let col_df = tson_to_dataframe(&col_tson).context("parse TSON column-facet payload")?;
+        .context("stream column-facet table")?;
 
     let n_cols = col_df.height();
     if n_cols == 0 {
@@ -245,11 +243,9 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         .collect::<Result<Vec<_>>>()?;
 
     // --- Stream row-facet: variable per .ri (positional) ---
-    let row_tson = streamer
-        .stream_tson(&row_table_id, Some(vec![variable_col.clone()]), 0, -1)
+    let row_df = paged_stream_df(&streamer, &row_table_id, vec![variable_col.clone()])
         .await
-        .map_err(|e| anyhow!("stream row-facet table {row_table_id}: {e}"))?;
-    let row_df = tson_to_dataframe(&row_tson).context("parse TSON row-facet payload")?;
+        .context("stream row-facet table")?;
     let n_var_rows = row_df.height();
     if n_var_rows == 0 {
         bail!("row-facet table is empty — no gathered variables to process.");
@@ -281,48 +277,42 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         }
     }
 
-    // --- Stream main data table ---
-    let qt_tson = streamer
-        .stream_tson(
-            &qt_table_id,
-            Some(vec![".ci".to_string(), ".ri".to_string(), ".y".to_string()]),
-            0,
-            -1,
-        )
-        .await
-        .map_err(|e| anyhow!("stream main data table {qt_table_id}: {e}"))?;
-    // Manual TSON decode: tercen-rs' `tson_to_dataframe` reads
-    // `col["data"]` per column, but the Tercen TSON encoding uses
-    // `col["values"]` (confirmed by reading rustson's test fixtures +
-    // the Python SDK's `tson_to_polars`). The wrong key produces a
-    // short / null-padded `.y` column past ~14976 rows on this dataset,
-    // which is the bug that made every chip 11+ NaN-fill in the
-    // operator's QT output.
-    //
-    // If the manual decoder fails (e.g. the actual TSON has yet a
-    // third structure we haven't covered yet), fall back to the
-    // tercen-rs path so the operator still produces output. The
-    // diagnostic logs from `decode_main_data_yy` will tell us what
-    // shape the TSON actually has so we can fix it.
-    let mut tson_diagnostic = String::with_capacity(2048);
+    // --- Stream main data table (paginated; Tercen caps -1 reads at 15k rows) ---
+    let qt_df = paged_stream_df(
+        &streamer,
+        &qt_table_id,
+        vec![".ci".to_string(), ".ri".to_string(), ".y".to_string()],
+    )
+    .await
+    .context("stream main data table")?;
+    let mut tson_diagnostic = String::with_capacity(256);
     use std::fmt::Write as _;
-    let yy = match decode_main_data_yy(&qt_tson, &mut tson_diagnostic) {
-        Ok(map) => {
-            let _ = writeln!(tson_diagnostic, "OK manual yy_size={}", map.len());
-            map
-        }
-        Err(e) => {
-            let _ = writeln!(tson_diagnostic, "MANUAL_ERR {e:#}");
-            tracing::error!(
-                "manual TSON decode failed: {e:#}. Falling back to tercen-rs \
-                 tson_to_dataframe path — chips 11+ will likely NaN-fill in \
-                 the QT output, but the operator will at least produce SOMETHING."
-            );
-            let map = fallback_yy_via_dataframe(&qt_tson, &mut tson_diagnostic)?;
-            let _ = writeln!(tson_diagnostic, "FALLBACK yy_size={}", map.len());
-            map
-        }
-    };
+    let _ = writeln!(
+        tson_diagnostic,
+        "qt_df rows={} cols={:?} (paged 10k/page until short page)",
+        qt_df.height(),
+        qt_df.get_column_names()
+    );
+    let ci_s = owned_i32(&qt_df, ".ci")?;
+    let ri_s = owned_i32(&qt_df, ".ri")?;
+    let y_col = qt_df
+        .column(".y")
+        .map_err(|e| anyhow!("missing .y on main data: {e}"))?
+        .cast(&DataType::Float64)
+        .context("cast .y to f64")?;
+    let y_s = y_col.take_materialized_series();
+    let ci_c = ci_s.i32().context(".ci not int32")?;
+    let ri_c = ri_s.i32().context(".ri not int32")?;
+    let y_c = y_s.f64().context(".y not f64")?;
+    let n = ci_c.len();
+    let mut yy: HashMap<(i32, i32), f64> = HashMap::with_capacity(n);
+    for i in 0..n {
+        let (Some(ci), Some(ri), Some(y)) = (ci_c.get(i), ri_c.get(i), y_c.get(i)) else {
+            continue;
+        };
+        yy.insert((ci, ri), y);
+    }
+    let _ = writeln!(tson_diagnostic, "yy_size={}", yy.len());
     if yy.is_empty() {
         bail!("main data table yielded zero non-null (.ci, .ri, .y) tuples.");
     }
@@ -449,6 +439,49 @@ fn strip_namespace(s: &str) -> &str {
     s.split_once('.').map(|(_, rest)| rest).unwrap_or(s)
 }
 
+/// Tercen caps single `streamTable` responses at 15 000 rows regardless
+/// of `limit = -1`, so unlimited reads silently truncate. R operators
+/// work because the R SDK pages internally; Rust's tercen-rs leaves
+/// pagination to the caller. We loop with explicit `offset` / `limit`
+/// and vstack the resulting DataFrames until a short page signals EOF.
+async fn paged_stream_df(
+    streamer: &tercen_rs::table::TableStreamer<'_>,
+    table_id: &str,
+    cols: Vec<String>,
+) -> Result<DataFrame> {
+    const PAGE: i64 = 10_000;
+    let mut offset: i64 = 0;
+    let mut acc: Option<DataFrame> = None;
+    loop {
+        let bytes = streamer
+            .stream_tson(table_id, Some(cols.clone()), offset, PAGE)
+            .await
+            .map_err(|e| anyhow!("stream {table_id} @ offset {offset}: {e}"))?;
+        if bytes.is_empty() {
+            break;
+        }
+        let df = tson_to_dataframe(&bytes)
+            .with_context(|| format!("decode page @ offset {offset} of {table_id}"))?;
+        let h = df.height();
+        if h == 0 {
+            break;
+        }
+        acc = Some(match acc {
+            None => df,
+            Some(mut prev) => {
+                prev.vstack_mut(&df)
+                    .map_err(|e| anyhow!("vstack page @ offset {offset}: {e}"))?;
+                prev
+            }
+        });
+        offset += h as i64;
+        if (h as i64) < PAGE {
+            break;
+        }
+    }
+    Ok(acc.unwrap_or_default())
+}
+
 /// Pull a string column out of a `DataFrame` as an owned `Series`,
 /// casting if necessary. The owned `Series` is needed because polars'
 /// `&StringChunked` accessors borrow from a `Series` that has to
@@ -471,305 +504,3 @@ fn owned_i32(df: &DataFrame, name: &str) -> Result<Series> {
     Ok(col.take_materialized_series())
 }
 
-/// Decode the QT main-data TSON payload into a `(.ci, .ri) → .y` map
-/// manually, reading the **correct** column-values key (`"values"`).
-///
-/// Why this exists: `tercen_rs::tson_to_dataframe` reads `col["data"]`,
-/// but Tercen's TSON main-data tables use `col["values"]` (confirmed
-/// by rustson's test fixtures + the Python SDK's `tson_to_polars`).
-/// Using the wrong key silently produces a short / null-padded `.y`
-/// column past ~14976 rows on production data, and every chip past
-/// that row index NaN-fills downstream.
-///
-/// Structure expected:
-///
-/// ```text
-/// MAP {
-///   "cols": LST [
-///     MAP { "name": "ci", "values": LSTI32 [...] },
-///     MAP { "name": "ri", "values": LSTI32 [...] },
-///     MAP { "name": "y",  "values": LSTF64 [...] },
-///   ]
-/// }
-/// ```
-///
-/// Walks the column list, finds `.ci`/`.ri`/`.y` by their `name`
-/// field, validates that all three have the same length, then walks
-/// row-by-row to build the lookup map. Logs the per-column lengths
-/// + null counts for visibility.
-fn decode_main_data_yy(
-    tson_bytes: &[u8],
-    diag: &mut String,
-) -> Result<HashMap<(i32, i32), f64>> {
-    use rustson::Value;
-    use std::fmt::Write;
-    let root = rustson::decode_bytes(tson_bytes)
-        .map_err(|e| anyhow!("rustson decode_bytes: {:?}", e))?;
-    let _ = writeln!(
-        diag,
-        "bytes={} root_kind={}",
-        tson_bytes.len(),
-        root_kind_name(&root)
-    );
-    tracing::info!(
-        bytes = tson_bytes.len(),
-        root_kind = root_kind_name(&root),
-        "TSON root decoded"
-    );
-
-    // Find the column list. Tercen TSON appears in two shapes in the
-    // wild: `MAP { "cols": LST [...] }` (what tercen-rs's
-    // tson_to_dataframe expects) or `MAP { "columns": LST [...] }`
-    // (what Python's tson_to_polars expects). Also handle the case
-    // where the top level is the LST itself.
-    let cols_owned: Vec<Value> = match &root {
-        Value::MAP(m) => {
-            let keys: Vec<String> = m.keys().cloned().collect();
-            let _ = writeln!(diag, "root_map_keys={:?}", keys);
-            tracing::info!(top_keys = ?keys, "TSON root is MAP");
-            if let Some(Value::LST(l)) = m.get("cols") {
-                let _ = writeln!(diag, "cols_lst_len={}", l.len());
-                tracing::info!(n_cols = l.len(), "found `cols` key");
-                l.clone()
-            } else if let Some(Value::LST(l)) = m.get("columns") {
-                let _ = writeln!(diag, "columns_lst_len={}", l.len());
-                tracing::info!(n_cols = l.len(), "found `columns` key");
-                l.clone()
-            } else {
-                bail!(
-                    "no `cols` or `columns` LST in TSON root MAP (keys: {:?})",
-                    keys
-                );
-            }
-        }
-        Value::LST(l) => {
-            let _ = writeln!(diag, "root_lst_len={}", l.len());
-            tracing::info!(n_cols = l.len(), "TSON root is bare LST");
-            l.clone()
-        }
-        other => bail!("expected TSON MAP or LST at root, got {}", root_kind_name(other)),
-    };
-    tracing::info!(n_cols = cols_owned.len(), "TSON cols list");
-
-    let mut ci: Option<Vec<i32>> = None;
-    let mut ri: Option<Vec<i32>> = None;
-    let mut y: Option<Vec<f64>> = None;
-    for (idx, col) in cols_owned.iter().enumerate() {
-        let Value::MAP(col_map) = col else {
-            tracing::warn!(idx, kind = root_kind_name(col), "col is not a MAP — skipping");
-            continue;
-        };
-        let col_keys: Vec<String> = col_map.keys().cloned().collect();
-        let name = col_map
-            .get("name")
-            .or_else(|| col_map.get("Name"))
-            .and_then(|v| if let Value::STR(s) = v { Some(s.clone()) } else { None });
-        // Try the two known keys for the actual data: `values` (Python
-        // SDK convention, also what rustson tests use) and `data`
-        // (tercen-rs convention). Pick whichever is present.
-        let values_val = col_map.get("values");
-        let data_val = col_map.get("data");
-        let values = values_val.or(data_val);
-        let value_kind = values.map(root_kind_name).unwrap_or("None");
-        let values_len = values.and_then(typed_data_len).unwrap_or(0);
-        // Critical for the bug: if both `values` and `data` exist with
-        // DIFFERENT lengths, that's the smoking gun for the tercen-rs
-        // tson_to_dataframe truncation. Capture both side by side.
-        let values_key_len = values_val.and_then(typed_data_len).unwrap_or(0);
-        let data_key_len = data_val.and_then(typed_data_len).unwrap_or(0);
-        let _ = writeln!(
-            diag,
-            "col[{}] name={:?} keys={:?} value_kind={} chosen_len={} values_key_len={} data_key_len={}",
-            idx,
-            name.as_deref().unwrap_or("<unnamed>"),
-            col_keys,
-            value_kind,
-            values_len,
-            values_key_len,
-            data_key_len,
-        );
-        tracing::info!(
-            idx,
-            name = name.as_deref().unwrap_or("<unnamed>"),
-            keys = ?col_keys,
-            value_kind,
-            values_len,
-            "col"
-        );
-        let Some(name) = name else { continue };
-        match name.as_str() {
-            ".ci" => ci = extract_i32(values)?,
-            ".ri" => ri = extract_i32(values)?,
-            ".y" => y = extract_f64(values)?,
-            _ => {}
-        }
-    }
-    let ci = ci.ok_or_else(|| anyhow!("`.ci` column missing from TSON"))?;
-    let ri = ri.ok_or_else(|| anyhow!("`.ri` column missing from TSON"))?;
-    let y = y.ok_or_else(|| anyhow!("`.y` column missing from TSON"))?;
-    let _ = writeln!(
-        diag,
-        "decoded ci_len={} ri_len={} y_len={}",
-        ci.len(),
-        ri.len(),
-        y.len()
-    );
-    tracing::info!(
-        ci_len = ci.len(),
-        ri_len = ri.len(),
-        y_len = y.len(),
-        "QT main-data column lengths (manual TSON decode)"
-    );
-    if !(ci.len() == ri.len() && ri.len() == y.len()) {
-        bail!(
-            "main-data column lengths still mismatched after manual decode: \
-             ci={}, ri={}, y={}",
-            ci.len(), ri.len(), y.len()
-        );
-    }
-    let n = ci.len();
-    let mut yy: HashMap<(i32, i32), f64> = HashMap::with_capacity(n);
-    let mut n_y_nan = 0usize;
-    for i in 0..n {
-        if y[i].is_nan() {
-            n_y_nan += 1;
-        }
-        yy.insert((ci[i], ri[i]), y[i]);
-    }
-    tracing::info!(yy_size = yy.len(), n_y_nan, "QT main-data yy map built");
-    Ok(yy)
-}
-
-/// Fallback that uses tercen-rs's `tson_to_dataframe` path. Same code
-/// as before — kept for graceful degradation if the manual decoder
-/// can't find the column data. Produces a `(.ci, .ri) → .y` map with
-/// (most likely) the broken short-`.y` behaviour that motivated the
-/// manual decode in the first place; the operator's output will then
-/// be partially NaN-filled, but at least the rest of the pipeline
-/// runs and we get diagnostic information.
-fn fallback_yy_via_dataframe(
-    tson_bytes: &[u8],
-    diag: &mut String,
-) -> Result<HashMap<(i32, i32), f64>> {
-    use std::fmt::Write;
-    let df = tson_to_dataframe(tson_bytes).context("fallback tson_to_dataframe")?;
-    let _ = writeln!(
-        diag,
-        "FALLBACK df_height={} df_width={} cols={:?}",
-        df.height(),
-        df.width(),
-        df.get_column_names()
-    );
-    tracing::warn!(
-        df_height = df.height(),
-        df_width = df.width(),
-        df_columns = ?df.get_column_names(),
-        "fallback DataFrame parsed (likely short)"
-    );
-    let ci_s = owned_i32(&df, ".ci")?;
-    let ri_s = owned_i32(&df, ".ri")?;
-    let y_col = df
-        .column(".y")
-        .map_err(|e| anyhow!("missing .y column on main table: {e}"))?
-        .cast(&DataType::Float64)
-        .context("cast .y to float64")?;
-    let y_s = y_col.take_materialized_series();
-    let ci_chunked = ci_s.i32().context(".ci is not int32")?;
-    let ri_chunked = ri_s.i32().context(".ri is not int32")?;
-    let y_chunked = y_s.f64().context(".y is not float64")?;
-    let n = ci_chunked.len().min(ri_chunked.len()).min(y_chunked.len());
-    let mut yy: HashMap<(i32, i32), f64> = HashMap::with_capacity(n);
-    for i in 0..n {
-        let (Some(ci), Some(ri), Some(y)) = (ci_chunked.get(i), ri_chunked.get(i), y_chunked.get(i))
-        else { continue };
-        yy.insert((ci, ri), y);
-    }
-    tracing::warn!(yy_size = yy.len(), "fallback yy map built");
-    Ok(yy)
-}
-
-/// Short debug name for a TSON Value variant — used when logging the
-/// structure we got vs what we expected. Avoids dumping multi-MB data
-/// from the actual variant.
-fn root_kind_name(v: &rustson::Value) -> &'static str {
-    use rustson::Value;
-    match v {
-        Value::NULL => "NULL",
-        Value::STR(_) => "STR",
-        Value::I32(_) => "I32",
-        Value::F64(_) => "F64",
-        Value::BOOL(_) => "BOOL",
-        Value::LST(_) => "LST",
-        Value::MAP(_) => "MAP",
-        Value::LSTU8(_) => "LSTU8",
-        Value::LSTI8(_) => "LSTI8",
-        Value::LSTU16(_) => "LSTU16",
-        Value::LSTI16(_) => "LSTI16",
-        Value::LSTU32(_) => "LSTU32",
-        Value::LSTI32(_) => "LSTI32",
-        Value::LSTU64(_) => "LSTU64",
-        Value::LSTI64(_) => "LSTI64",
-        Value::LSTF32(_) => "LSTF32",
-        Value::LSTF64(_) => "LSTF64",
-        Value::LSTSTR(_) => "LSTSTR",
-    }
-}
-
-/// Length of a typed-array TSON value, or 0 for non-array kinds. Used
-/// for diagnostics — we want to see whether `values` and `data` have
-/// the same length on each column.
-fn typed_data_len(v: &rustson::Value) -> Option<usize> {
-    use rustson::Value;
-    Some(match v {
-        Value::LST(l) => l.len(),
-        Value::LSTU8(l) => l.len(),
-        Value::LSTI8(l) => l.len(),
-        Value::LSTU16(l) => l.len(),
-        Value::LSTI16(l) => l.len(),
-        Value::LSTU32(l) => l.len(),
-        Value::LSTI32(l) => l.len(),
-        Value::LSTU64(l) => l.len(),
-        Value::LSTI64(l) => l.len(),
-        Value::LSTF32(l) => l.len(),
-        Value::LSTF64(l) => l.len(),
-        // StrVec stores bytes — closest analogue to "length" is byte count.
-        Value::LSTSTR(l) => l.bytes.len(),
-        _ => return None,
-    })
-}
-
-/// Pull an i32 array out of a TSON column-values field. Accepts a few
-/// integer-typed variants since the encoder may pick a smaller width
-/// for compact tables.
-fn extract_i32(values: Option<&rustson::Value>) -> Result<Option<Vec<i32>>> {
-    use rustson::Value;
-    match values {
-        None => Ok(None),
-        Some(Value::LSTI32(v)) => Ok(Some(v.clone())),
-        Some(Value::LSTI16(v)) => Ok(Some(v.iter().map(|&x| x as i32).collect())),
-        Some(Value::LSTU16(v)) => Ok(Some(v.iter().map(|&x| x as i32).collect())),
-        Some(Value::LSTI64(v)) => Ok(Some(v.iter().map(|&x| x as i32).collect())),
-        Some(Value::LSTU32(v)) => Ok(Some(v.iter().map(|&x| x as i32).collect())),
-        Some(Value::LSTF64(v)) => Ok(Some(v.iter().map(|&x| x as i32).collect())),
-        Some(other) => bail!(
-            "expected integer-list for column values, got {:?}",
-            std::mem::discriminant(other)
-        ),
-    }
-}
-
-/// Pull an f64 array out of a TSON column-values field.
-fn extract_f64(values: Option<&rustson::Value>) -> Result<Option<Vec<f64>>> {
-    use rustson::Value;
-    match values {
-        None => Ok(None),
-        Some(Value::LSTF64(v)) => Ok(Some(v.clone())),
-        Some(Value::LSTF32(v)) => Ok(Some(v.iter().map(|&x| x as f64).collect())),
-        Some(Value::LSTI32(v)) => Ok(Some(v.iter().map(|&x| x as f64).collect())),
-        Some(Value::LSTI64(v)) => Ok(Some(v.iter().map(|&x| x as f64).collect())),
-        Some(other) => bail!(
-            "expected float-list for column values, got {:?}",
-            std::mem::discriminant(other)
-        ),
-    }
-}

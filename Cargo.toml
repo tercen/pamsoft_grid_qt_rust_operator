@@ -51,13 +51,6 @@ zip = "0.6"
 # gRPC types for FileService request/response (server streaming download).
 tonic = "0.14"
 
-# Manual TSON decoder for the main data table. tercen-rs's
-# `tson_to_dataframe` reads `col["data"]` per column, but the actual
-# Tercen TSON encoding uses `col["values"]` — so high-row data ends up
-# null/short in the resulting DataFrame. We decode raw bytes ourselves
-# via rustson to read the right key.
-rustson = { git = "https://github.com/tercen/rustson", branch = "master" }
-
 [profile.release]
 opt-level = 3
 lto = "fat"
