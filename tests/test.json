@@ -1,0 +1,16 @@
+{
+  "kind": "OperatorUnitTest",
+  "name": "alex_chip_qt",
+  "namespace": "ds0",
+  "inputFileUris": ["alex_test_chip.zip"],
+  "inputDataUri": "test1_in.csv",
+  "outputDataUri": [],
+  "columns": ["documentId", "grdImageNameUsed", "Image", "spotRow", "spotCol", "ID"],
+  "rows": ["variable"],
+  "colors": [],
+  "labels": [],
+  "yAxis": "value",
+  "xAxis": "",
+  "equalityMethod": "R2",
+  "r2": 0.99
+}
