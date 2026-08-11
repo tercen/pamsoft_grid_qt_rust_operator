@@ -142,12 +142,17 @@ async fn execute(ctx: &ContextBase, task_id: Option<&str>) -> Result<()> {
         "QT algorithm complete"
     );
 
+    // The TSON-shape diagnostic used to be embedded in the result table's
+    // `Tson_Diagnostic` column, but its multi-line content corrupts CSV
+    // export. Emit it to the logs instead (bump to info! if it needs to be
+    // visible in prod).
+    tracing::debug!(tson_diagnostic = %input_data.tson_diagnostic, "QT input TSON diagnostic");
+
     // Stage 6: build the Polars result DataFrame.
     let df = output::build_result_df(
         &chip_results,
         ctx.namespace(),
         pamsoft_props.is_diagnostic,
-        &input_data.tson_diagnostic,
     )
     .map_err(|e| anyhow::anyhow!("build result DataFrame: {e:#}"))?;
     tracing::info!(
