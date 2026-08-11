@@ -204,9 +204,28 @@ fn run_one_chip(
     }
 
     let started = std::time::Instant::now();
-    let results = process_single_group_qt(&group)
+    let mut results = process_single_group_qt(&group)
         .map_err(|e| anyhow!("chip '{}' QT pipeline: {}", chip_name, e))?;
     let elapsed = started.elapsed();
+
+    // Replaced_Spot (issue #1): MATLAB's @spotQuantification flags every bad or
+    // empty spot as "replaced" — replaceEmptySpots / replaceBadSpots swap the
+    // spot's segmentation for the default spot and set isReplaced = true, and
+    // getResult.m emits `Replaced_Spot = isReplaced`. The pamsoft_grid crate
+    // hard-codes `is_replaced = 0`, so the column was always 0 vs the MATLAB
+    // operator's ~71%. Apply the per-spot rule (bad || empty) here.
+    //
+    // NOTE: this is the per-spot port of the two replace* functions. Full
+    // parity with the *series-combined* MATLAB output — where check4EmptySpots
+    // runs per cycle and the final Empty_Spot is re-derived at the combine
+    // stage, so a minority of series-empty spots are not on the replacement
+    // pass — plus setAsDftSpot's effect on the replaced spots' quantified
+    // values, is follow-up. See issue #1 and tercen/pg_image_analysis.
+    for r in results.iter_mut() {
+        if r.is_bad != 0 || r.is_empty != 0 {
+            r.is_replaced = 1;
+        }
+    }
 
     // Diagnostic: count NaN results and log a sample. The production
     // QT output has ~82% NaN on Mean_Signal across most chips while
