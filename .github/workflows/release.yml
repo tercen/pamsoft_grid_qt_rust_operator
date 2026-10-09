@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
     - uses: actions/checkout@v2
       with:
@@ -43,20 +45,38 @@ jobs:
         docker push $DOCKER_IMAGE:$TAG
         docker tag $DOCKER_IMAGE:$TAG $DOCKER_IMAGE:latest
         docker push $DOCKER_IMAGE:latest
-    # Integration test against a live Tercen instance. Disabled while the
-    # operator is still stubs; re-enable once the repo is public or a PAT
-    # with read access is wired as TERCEN_GITHUB_TOKEN.
+    - name: Pin operator.json to the tagged image and re-point the tag
+      # The 'Update container' step rewrites operator.json to the versioned
+      # image, but that change was never committed — so a Tercen git-install
+      # of the tag read :latest and the worker ran a stale cached image.
+      # Commit the pinned operator.json and force-move the tag onto it.
+      # Pushing with GITHUB_TOKEN does NOT re-trigger this workflow (Actions'
+      # recursion guard); '[skip ci]' is belt-and-braces.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        if git diff --quiet -- operator.json; then
+          echo "operator.json already pinned; nothing to do"
+          exit 0
+        fi
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add operator.json
+        git commit -m "release $TAG: pin operator.json to $DOCKER_IMAGE:$TAG [skip ci]"
+        git tag -f "$TAG"
+        git push -f origin "refs/tags/$TAG"
+    # Install-check against the stage instance: installs the pinned tag and
+    # runs tests/ (golden PTK test). Fatal by design — a red check must stop
+    # the release before it is listed.
     - name: Pull tercenctl
-      if: false
       run: docker pull tercen/tercenctl:release
     - name: Install operator
-      if: false
       run: |
         docker run --rm \
           -e TERCEN_USERNAME=${{ secrets.TERCEN_TEST_OPERATOR_USERNAME }} \
           -e TERCEN_PASSWORD=${{ secrets.TERCEN_TEST_OPERATOR_PASSWORD }} \
           -e TERCEN_URI=${{ secrets.TERCEN_TEST_OPERATOR_URI }} \
-          -e GITHUB_TOKEN=${{ secrets.TERCEN_GITHUB_TOKEN }} \
+          -e GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
           tercen/tercenctl:release operator install --rm --tag ${TAG} --repo ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
     - name: Create required package.json
       run: echo '{}' > package.json

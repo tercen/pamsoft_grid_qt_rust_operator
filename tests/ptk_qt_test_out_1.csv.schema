@@ -1,0 +1,342 @@
+{
+  "kind": "ComputedTableSchema",
+  "isDeleted": false,
+  "description": "",
+  "name": "786f5f9a-7916-48c2-9b3b-4343a0e3b261",
+  "acl": {
+    "kind": "Acl",
+    "owner": "admin",
+    "aces": []
+  },
+  "createdDate": {
+    "kind": "Date",
+    "value": "2026-10-09T23:23:49.315896Z"
+  },
+  "lastModifiedDate": {
+    "kind": "Date",
+    "value": "2026-10-09T23:23:49.315896Z"
+  },
+  "urls": [],
+  "tags": [],
+  "meta": [],
+  "url": {
+    "kind": "Url",
+    "uri": ""
+  },
+  "version": "",
+  "isPublic": false,
+  "projectId": "5bfaae14-b56a-44ee-b925-07955f30e939",
+  "folderId": "",
+  "nRows": 1224,
+  "columns": [
+    {
+      "kind": "ColumnSchema",
+      "id": "5b47bc8f-0764-4c40-989b-22f89f4201ad",
+      "name": ".ci",
+      "type": "int32",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "d34ba452-9166-4a5d-9016-494eccbab8cf",
+      "name": "ds1.Mean_Signal",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "d7097896-29ba-4f5b-87fc-fa267b007cc0",
+      "name": "ds1.Median_Signal",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "f981416a-fb66-49c1-b397-2fa03779af62",
+      "name": "ds1.Mean_Background",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "1c6c3e28-b154-408b-81ec-c299ee39367f",
+      "name": "ds1.Median_Background",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "2901e0a6-27fa-411d-a8cf-b1ad9be8092b",
+      "name": "ds1.Mean_SigmBg",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "f21d44e6-d55d-40e5-8928-0afa1c724496",
+      "name": "ds1.Median_SigmBg",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "033124bd-db57-4179-b55c-b74e7f0174d8",
+      "name": "ds1.Position_Offset",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "decb4778-d90f-4485-bde8-38f00aa60665",
+      "name": "ds1.Bad_Spot",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "90e397b2-a279-4721-bb43-de2255b684ed",
+      "name": "ds1.Empty_Spot",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "51bab3d8-2a2e-4eab-9271-737afa938be9",
+      "name": "ds1.Replaced_Spot",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "b33c9df3-a23c-4ee8-bdd0-56364b163acc",
+      "name": "ds1.Fraction_Ignored",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "a9c05126-15b6-4f03-943e-e4435b4eed6f",
+      "name": "ds1.Diameter",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "ee531ee6-b130-4438-99a7-fb0288911e6d",
+      "name": "ds1.Signal_Saturation",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "5063fc11-1832-4fc5-8428-07e8d2a81351",
+      "name": "ds1.gridX",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "7e5054f3-24ab-4df0-9f33-b7b0c9ff0fd6",
+      "name": "ds1.gridY",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    }
+  ],
+  "dataDirectory": "default/76/70/7076f297bc8e490796103a28fd61032a",
+  "relation": {
+    "kind": "Relation",
+    "id": "8cc22205-47fa-404e-b758-37f2d2b7f24c"
+  },
+  "size": 0,
+  "storageSize": 131304.0,
+  "query": {
+    "kind": "CubeQuery",
+    "relation": {
+      "kind": "Relation",
+      "id": "68685246-3e5b-4bc6-af67-549bae83f9e6"
+    },
+    "colColumns": [],
+    "rowColumns": [],
+    "axisQueries": [],
+    "filters": {
+      "kind": "Filters",
+      "removeNaN": true,
+      "namedFilters": []
+    },
+    "operatorSettings": {
+      "kind": "OperatorSettings",
+      "namespace": "",
+      "operatorRef": {
+        "kind": "OperatorRef",
+        "name": "",
+        "version": "",
+        "operatorId": "",
+        "operatorKind": "",
+        "propertyValues": [],
+        "url": {
+          "kind": "Url",
+          "uri": ""
+        },
+        "operatorSpec": {
+          "kind": "OperatorSpec",
+          "ontologyUri": "",
+          "ontologyVersion": "",
+          "inputSpecs": [],
+          "outputSpecs": [],
+          "outputSpecsV2": []
+        }
+      },
+      "environment": [],
+      "operatorModel": {
+        "kind": "OperatorModel"
+      }
+    },
+    "qtHash": "",
+    "columnHash": "",
+    "rowHash": ""
+  }
+}
