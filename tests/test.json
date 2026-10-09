@@ -4,7 +4,7 @@
   "namespace": "ds1",
   "inputFileUris": ["ptk_qt_test_images.zip"],
   "inputDataUri": "ptk_qt_test_input.csv",
-  "outputDataUri": [],
+  "outputDataUri": ["ptk_qt_test_out_1.csv", "ptk_qt_test_out_2.csv"],
   "columns": ["documentId", "ds0.grdImageNameUsed", "Image", "ds0.spotRow", "ds0.spotCol", "ds0.ID"],
   "rows": ["variable"],
   "colors": [],
