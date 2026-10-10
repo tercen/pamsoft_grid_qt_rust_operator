@@ -1,11 +1,18 @@
 {
   "name": "pamsoft_grid_qt_rust_operator",
   "description": "PamSoft quantification operator. Rust port of the original MATLAB MCR implementation. Takes the melted output of the pamsoft_grid step (joined with the source images) and produces per-spot quantification stats.",
-  "tags": ["image analysis"],
+  "tags": [
+    "image analysis"
+  ],
   "communicationProtocol": "grpc",
-  "authors": ["Tercen", "Thiago"],
-  "urls": ["https://github.com/tercen/pamsoft_grid_qt_rust_operator"],
-  "container": "pamgene/pamsoft_grid_qt_rust_operator:latest",
+  "authors": [
+    "Tercen",
+    "Thiago"
+  ],
+  "urls": [
+    "https://github.com/tercen/pamsoft_grid_qt_rust_operator"
+  ],
+  "container": "pamgene/pamsoft_grid_qt_rust_operator:0.2.14",
   "properties": [
     {
       "kind": "DoubleProperty",
@@ -61,7 +68,10 @@
       "name": "Segmentation Method",
       "defaultValue": "Edge",
       "description": "Per-spot segmentation algorithm.",
-      "values": ["Edge", "Hough"]
+      "values": [
+        "Edge",
+        "Hough"
+      ]
     },
     {
       "kind": "StringProperty",
@@ -75,7 +85,10 @@
       "name": "Diagnostic Output",
       "defaultValue": "Yes",
       "description": "When 'No', the result table drops the diagnostic-only columns (Bad_Spot, Diameter, Empty_Spot, Fraction_Ignored, Position_Offset, Replaced_Spot, Mean_Background, Mean_SigmBg, Mean_Signal) — matching the R operator's behaviour.",
-      "values": ["Yes", "No"]
+      "values": [
+        "Yes",
+        "No"
+      ]
     }
   ],
   "operatorSpec": {
